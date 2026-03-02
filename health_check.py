@@ -18,6 +18,14 @@ def check_imports():
         from execution.paper_executor import PaperExecutor
         from execution.bridge_executor import BridgeExecutor
         from runners.notifier import TelegramNotifier
+        from data.market_scanner import MarketScanner
+        from data.clob_client import ClobReader
+        from data.websocket_client import PolymarketWebSocket
+        from data.market_cache import MarketCache
+        from data.storage import Storage
+        from data.sources.news_feed import NewsFeed
+        from data.sources.economic_data import EconomicDataFeed
+        from data.sources.polls import PollsFeed
         print("  All imports OK")
         return True
     except ImportError as e:
@@ -103,15 +111,38 @@ def check_clob_api():
     """Test CLOB API connectivity."""
     print("Checking Polymarket API...")
     try:
-        import requests
-        from core.constants import GAMMA_API_URL
-        resp = requests.get(f"{GAMMA_API_URL}/markets?limit=1", timeout=10)
-        if resp.status_code == 200:
-            markets = resp.json()
-            count = len(markets) if isinstance(markets, list) else 0
-            print(f"  Gamma API: OK (fetched {count} market)")
+        from data.market_scanner import MarketScanner
+        from data.clob_client import ClobReader
+
+        scanner = MarketScanner()
+        markets = scanner.scan(limit=5, min_volume_24h=100)
+        print(f"  Gamma API: OK (found {len(markets)} markets)")
+
+        if markets:
+            reader = ClobReader()
+            tok = markets[0].yes_token_id
+            mid = reader.get_midpoint(tok)
+            if mid is not None:
+                print(f"  CLOB API: OK (midpoint={mid:.4f})")
+            else:
+                print(f"  CLOB API: midpoint returned None")
+        return True
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        return False
+
+
+def check_news_feed():
+    """Test news feed RSS connectivity."""
+    print("Checking news feeds...")
+    try:
+        from data.sources.news_feed import NewsFeed
+        nf = NewsFeed()
+        articles = nf.fetch_rss("https://feeds.bbci.co.uk/news/rss.xml", max_items=3)
+        if articles:
+            print(f"  RSS feed: OK ({len(articles)} articles)")
             return True
-        print(f"  Gamma API: HTTP {resp.status_code}")
+        print("  RSS feed: No articles returned")
         return False
     except Exception as e:
         print(f"  FAIL: {e}")
@@ -172,6 +203,7 @@ def main():
         "Environment": check_env(),
         "Paper Executor": check_paper_executor(),
         "CLOB API": check_clob_api(),
+        "News Feed": check_news_feed(),
         "Bridge": check_bridge(),
         "Telegram": check_telegram(),
     }
@@ -182,7 +214,7 @@ def main():
     for name, passed in results.items():
         status = "PASS" if passed else "FAIL"
         print(f"  {name}: {status}")
-        if not passed and name not in ("Bridge", "Telegram", "Environment"):
+        if not passed and name not in ("Bridge", "Telegram", "Environment", "News Feed"):
             all_pass = False
 
     print("=" * 50)

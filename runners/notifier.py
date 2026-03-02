@@ -2,7 +2,7 @@
 
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 
@@ -64,7 +64,7 @@ class TelegramNotifier:
             f"<b>Size:</b> ${size:.2f}\n"
             f"<b>Edge:</b> {edge:.1%}\n"
             f"<b>Strategy:</b> {strategy}\n"
-            f"<b>Time:</b> {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+            f"<b>Time:</b> {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
         )
         self.send(msg)
 
@@ -85,7 +85,7 @@ class TelegramNotifier:
             f"<b>Entry:</b> ${entry_price:.4f} → <b>Exit:</b> ${exit_price:.4f}\n"
             f"<b>P/L:</b> ${pnl:.2f}\n"
             f"<b>Reason:</b> {reason}\n"
-            f"<b>Time:</b> {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+            f"<b>Time:</b> {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
         )
         self.send(msg)
 

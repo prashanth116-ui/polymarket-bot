@@ -1,7 +1,7 @@
 """Core type definitions for the Polymarket trading bot."""
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
@@ -95,7 +95,7 @@ class Market:
     def hours_to_resolution(self) -> Optional[float]:
         if self.end_date is None:
             return None
-        delta = self.end_date - datetime.utcnow()
+        delta = self.end_date - datetime.now(timezone.utc)
         return max(0, delta.total_seconds() / 3600)
 
 
@@ -108,7 +108,7 @@ class ProbabilityEstimate:
     confidence: float  # 0.0 to 1.0
     reasoning: str
     model_name: str
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     sources: list = field(default_factory=list)
 
     @property
@@ -134,7 +134,7 @@ class Signal:
     edge: float  # Estimated edge (model prob - market price)
     confidence: float
     reasoning: str
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     metadata: dict = field(default_factory=dict)
 
 
@@ -153,8 +153,8 @@ class Position:
     unrealized_pnl: float = 0.0
     realized_pnl: float = 0.0
     strategy: StrategyType = StrategyType.EDGE
-    opened_at: datetime = field(default_factory=datetime.utcnow)
-    last_updated: datetime = field(default_factory=datetime.utcnow)
+    opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
 
@@ -165,7 +165,7 @@ class Position:
     def update_pnl(self, current_price: float):
         self.current_price = current_price
         self.unrealized_pnl = (current_price - self.entry_price) * self.size
-        self.last_updated = datetime.utcnow()
+        self.last_updated = datetime.now(timezone.utc)
 
 
 @dataclass
@@ -181,7 +181,7 @@ class TradeResult:
     order_id: Optional[str] = None
     strategy: StrategyType = StrategyType.EDGE
     exit_reason: Optional[ExitReason] = None
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     paper: bool = True
 
     @property
@@ -202,7 +202,7 @@ class OrderBook:
     token_id: str
     bids: list  # List[OrderBookLevel], best first
     asks: list  # List[OrderBookLevel], best first
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def best_bid(self) -> float:
