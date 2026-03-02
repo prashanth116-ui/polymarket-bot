@@ -60,8 +60,8 @@ ARB_MIN_PROFIT_BPS = 50  # Min profit in basis points (0.5%)
 ARB_MAX_POSITION = 100  # Max USDC per arb
 ARB_MAX_ARB_EXPOSURE = 200.0  # USDC total arb exposure
 
-# Binance WebSocket
-BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
+# Binance WebSocket (Binance.US — required for US-based servers)
+BINANCE_WS_URL = "wss://stream.binance.us:9443/ws"
 
 # Crypto scalper defaults
 CRYPTO_DEFAULT_POSITION_SIZE = 20.0  # USDC per trade
