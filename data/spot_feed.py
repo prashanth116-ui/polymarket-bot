@@ -1,8 +1,8 @@
-"""Binance WebSocket feed for real-time BTC/USDT spot price.
+"""Real-time BTC/USD spot price feed via Coinbase WebSocket.
 
 Thread-safe background feed following the same pattern as ws_price_feed.py.
-Connects to Binance public trade stream, maintains a rolling price buffer
-for momentum calculation.
+Connects to Coinbase Exchange ticker stream, maintains a rolling price buffer
+for momentum calculation. Uses Coinbase because Binance geo-blocks US servers.
 """
 
 import asyncio
@@ -14,16 +14,29 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
 
-from core.constants import BINANCE_WS_URL
-
 logger = logging.getLogger(__name__)
 
 # Rolling buffer holds 120 seconds of price data
 BUFFER_SECONDS = 120
 
+COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
+
+# Map common symbols to Coinbase product IDs
+_PRODUCT_MAP = {
+    "btcusdt": "BTC-USD",
+    "btcusd": "BTC-USD",
+    "ethusdt": "ETH-USD",
+    "ethusd": "ETH-USD",
+    "solusdt": "SOL-USD",
+    "solusd": "SOL-USD",
+}
+
 
 class BinanceSpotFeed:
-    """Real-time BTC/USDT price feed from Binance WebSocket.
+    """Real-time crypto spot price feed from Coinbase WebSocket.
+
+    Despite the class name (kept for backwards compatibility), this uses the
+    Coinbase Exchange WebSocket which works from US-based servers.
 
     Usage:
         feed = BinanceSpotFeed("btcusdt")
@@ -37,6 +50,7 @@ class BinanceSpotFeed:
 
     def __init__(self, symbol: str = "btcusdt"):
         self.symbol = symbol.lower()
+        self.product_id = _PRODUCT_MAP.get(self.symbol, "BTC-USD")
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._lock = threading.Lock()
@@ -58,10 +72,10 @@ class BinanceSpotFeed:
         self._thread = threading.Thread(
             target=self._run_loop,
             daemon=True,
-            name=f"binance-spot-{self.symbol}",
+            name=f"spot-feed-{self.product_id}",
         )
         self._thread.start()
-        logger.info(f"BinanceSpotFeed started for {self.symbol.upper()}")
+        logger.info(f"BinanceSpotFeed started for {self.product_id}")
 
     def _run_loop(self):
         """Background thread entry: create event loop and run WebSocket."""
@@ -72,42 +86,56 @@ class BinanceSpotFeed:
             self._loop.run_until_complete(self._async_run())
         except Exception as e:
             if self._started:
-                logger.error(f"BinanceSpotFeed thread error: {e}")
+                logger.error(f"SpotFeed thread error: {e}")
         finally:
             self._loop.close()
             self._loop = None
 
     async def _async_run(self):
-        """Connect to Binance trade stream with auto-reconnect."""
+        """Connect to Coinbase ticker stream with auto-reconnect."""
         try:
             import websockets
         except ImportError:
             logger.error("websockets package required: pip install websockets")
             return
 
-        url = f"{BINANCE_WS_URL}/{self.symbol}@trade"
-
         while self._started and not self._stop_event.is_set():
             try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-                    logger.info(f"Connected to Binance {self.symbol}@trade stream")
+                async with websockets.connect(
+                    COINBASE_WS_URL, ping_interval=20, ping_timeout=10
+                ) as ws:
+                    # Subscribe to ticker channel
+                    subscribe_msg = json.dumps({
+                        "type": "subscribe",
+                        "product_ids": [self.product_id],
+                        "channels": ["ticker"],
+                    })
+                    await ws.send(subscribe_msg)
+                    logger.info(f"Connected to Coinbase {self.product_id} ticker stream")
+
                     while self._started and not self._stop_event.is_set():
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
                             data = json.loads(msg)
-                            price = float(data["p"])
-                            trade_time_ms = data["T"]
-                            ts = datetime.fromtimestamp(trade_time_ms / 1000, tz=timezone.utc)
-                            self._on_trade(price, ts)
+                            if data.get("type") == "ticker":
+                                price = float(data["price"])
+                                ts_str = data.get("time", "")
+                                try:
+                                    ts = datetime.fromisoformat(
+                                        ts_str.replace("Z", "+00:00")
+                                    )
+                                except (ValueError, TypeError):
+                                    ts = datetime.now(timezone.utc)
+                                self._on_trade(price, ts)
                         except asyncio.TimeoutError:
                             continue
                         except Exception as e:
                             if self._started:
-                                logger.warning(f"Binance message error: {e}")
+                                logger.warning(f"Coinbase message error: {e}")
                             break
             except Exception as e:
                 if self._started and not self._stop_event.is_set():
-                    logger.warning(f"Binance WS disconnected: {e}, reconnecting in 5s...")
+                    logger.warning(f"Coinbase WS disconnected: {e}, reconnecting in 5s...")
                     await asyncio.sleep(5)
 
     def _on_trade(self, price: float, ts: datetime):
