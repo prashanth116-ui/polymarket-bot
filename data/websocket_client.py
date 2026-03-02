@@ -165,7 +165,15 @@ class PolymarketWebSocket:
 
     @property
     def connected(self) -> bool:
-        return self.ws is not None and self.ws.open
+        if self.ws is None:
+            return False
+        try:
+            # websockets v13+: use .state
+            from websockets.protocol import State
+            return self.ws.state is State.OPEN
+        except (ImportError, AttributeError):
+            # websockets <v13: use .open
+            return getattr(self.ws, "open", False)
 
     @property
     def subscription_count(self) -> int:
