@@ -1,0 +1,25 @@
+# Edge Strategy Configuration
+name: edge
+enabled: true
+
+# Entry conditions
+min_edge: 0.05  # Model prob - market price >= 5%
+min_confidence: 0.6
+min_liquidity: 500  # USDC in order book
+
+# Position sizing
+kelly_fraction: 0.25  # Quarter Kelly
+max_position: 100  # USDC
+
+# Exit conditions
+edge_gone_threshold: 0.02  # Exit when edge < 2%
+stop_loss_pct: 0.30  # Exit at 30% loss
+take_profit_pct: 0.50  # Exit at 50% gain
+near_resolution_hours: 6  # Reduce position 6h before resolution
+
+# LLM config
+llm:
+  screening_model: haiku  # Cheap model for initial screen
+  final_model: sonnet  # Better model for final estimate
+  cache_hours: 1
+  max_cost_per_day: 5.0  # USD

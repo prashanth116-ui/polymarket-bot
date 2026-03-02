@@ -1,0 +1,58 @@
+# Polymarket Trading Bot - Global Settings
+
+mode: paper  # paper | live
+
+# Bridge server
+bridge:
+  url: "http://127.0.0.1:8420"
+  timeout: 10  # seconds
+
+# Scan intervals (seconds)
+scan:
+  full_market_scan: 1800  # 30 min
+  price_poll: 60  # 1 min
+  news_poll: 900  # 15 min
+  heartbeat: 3600  # 1 hour
+
+# Risk limits
+risk:
+  max_position_size: 100  # USDC per position
+  max_positions: 10
+  max_daily_loss: 50  # USDC
+  max_consecutive_losses: 3
+  max_exposure_pct: 0.25  # 25% of bankroll
+  kelly_fraction: 0.25  # Quarter Kelly
+  min_hours_to_resolution: 24
+
+# Strategy defaults
+strategy:
+  min_edge: 0.05  # 5%
+  min_confidence: 0.6
+  min_liquidity: 500  # USDC
+
+# Market filters
+filters:
+  min_volume_24h: 100  # USDC
+  max_price_for_buy: 0.95
+  min_price_for_buy: 0.05
+  categories:
+    - politics
+    - crypto
+    - sports
+    - science
+    - economics
+
+# Telegram alerts
+telegram:
+  enabled: false
+  heartbeat_interval: 3600  # 1 hour
+
+# Logging
+logging:
+  level: INFO
+  file: logs/polymarket.log
+
+# Database
+database:
+  path: data/polymarket.db
+  retention_days: 90

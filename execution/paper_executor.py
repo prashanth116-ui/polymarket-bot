@@ -1,0 +1,257 @@
+"""Paper trading executor with simulated fills."""
+
+import logging
+import random
+from datetime import datetime
+from typing import Optional
+
+from core.constants import TAKER_FEE_BPS
+from core.types import (
+    ExitReason,
+    OrderBook,
+    OrderBookLevel,
+    Outcome,
+    Position,
+    Side,
+    StrategyType,
+    TradeResult,
+)
+from execution.executor_interface import ExecutorInterface
+
+logger = logging.getLogger(__name__)
+
+
+class PaperExecutor(ExecutorInterface):
+    """Simulated executor for paper trading."""
+
+    def __init__(
+        self,
+        initial_balance: float = 1000.0,
+        slippage_bps: int = 50,
+        fee_bps: int = TAKER_FEE_BPS,
+    ):
+        self.balance = initial_balance
+        self.initial_balance = initial_balance
+        self.slippage_bps = slippage_bps
+        self.fee_bps = fee_bps
+        self.positions: dict[str, Position] = {}  # key: market_id:outcome
+        self.trade_history: list[TradeResult] = []
+        self.total_fees = 0.0
+        self.daily_pnl = 0.0
+        self.daily_trades = 0
+        self._next_order_id = 1
+
+    def _position_key(self, market_id: str, outcome: Outcome) -> str:
+        return f"{market_id}:{outcome.value}"
+
+    def _apply_slippage(self, price: float, side: Side) -> float:
+        """Apply simulated slippage."""
+        slip = price * (self.slippage_bps / 10000)
+        if side == Side.BUY:
+            return min(0.99, price + slip)
+        return max(0.01, price - slip)
+
+    def _generate_order_id(self) -> str:
+        oid = f"paper-{self._next_order_id}"
+        self._next_order_id += 1
+        return oid
+
+    def buy(
+        self,
+        market_id: str,
+        token_id: str,
+        outcome: Outcome,
+        price: float,
+        size: float,
+        strategy: StrategyType = StrategyType.EDGE,
+    ) -> TradeResult:
+        fill_price = self._apply_slippage(price, Side.BUY)
+        cost = size * fill_price
+        fee = cost * (self.fee_bps / 10000)
+        total_cost = cost + fee
+
+        if total_cost > self.balance:
+            logger.warning(
+                f"Insufficient balance: need ${total_cost:.2f}, have ${self.balance:.2f}"
+            )
+            # Reduce size to fit
+            max_cost = self.balance / (1 + self.fee_bps / 10000)
+            size = max_cost / fill_price
+            cost = size * fill_price
+            fee = cost * (self.fee_bps / 10000)
+            total_cost = cost + fee
+
+        self.balance -= total_cost
+        self.total_fees += fee
+
+        # Update or create position
+        key = self._position_key(market_id, outcome)
+        if key in self.positions:
+            pos = self.positions[key]
+            total_size = pos.size + size
+            pos.entry_price = (pos.entry_price * pos.size + fill_price * size) / total_size
+            pos.size = total_size
+            pos.cost_basis += total_cost
+        else:
+            self.positions[key] = Position(
+                market_id=market_id,
+                condition_id=market_id,
+                outcome=outcome,
+                token_id=token_id,
+                side=Side.BUY,
+                entry_price=fill_price,
+                size=size,
+                cost_basis=total_cost,
+                current_price=fill_price,
+                strategy=strategy,
+            )
+
+        result = TradeResult(
+            market_id=market_id,
+            outcome=outcome,
+            side=Side.BUY,
+            price=fill_price,
+            size=size,
+            cost=cost,
+            fee=fee,
+            order_id=self._generate_order_id(),
+            strategy=strategy,
+            paper=True,
+        )
+        self.trade_history.append(result)
+        self.daily_trades += 1
+
+        logger.info(
+            f"PAPER BUY {outcome.value} @ ${fill_price:.4f} x {size:.2f} "
+            f"= ${total_cost:.2f} (fee ${fee:.2f}) | Balance: ${self.balance:.2f}"
+        )
+        return result
+
+    def sell(
+        self,
+        market_id: str,
+        token_id: str,
+        outcome: Outcome,
+        price: float,
+        size: float,
+        exit_reason: Optional[ExitReason] = None,
+    ) -> TradeResult:
+        fill_price = self._apply_slippage(price, Side.SELL)
+        revenue = size * fill_price
+        fee = revenue * (self.fee_bps / 10000)
+        net_revenue = revenue - fee
+
+        key = self._position_key(market_id, outcome)
+        pos = self.positions.get(key)
+
+        realized_pnl = 0.0
+        if pos:
+            realized_pnl = (fill_price - pos.entry_price) * size
+            pos.size -= size
+            if pos.size <= 0.01:  # Effectively closed
+                del self.positions[key]
+            else:
+                pos.realized_pnl += realized_pnl
+
+        self.balance += net_revenue
+        self.total_fees += fee
+        self.daily_pnl += realized_pnl
+
+        result = TradeResult(
+            market_id=market_id,
+            outcome=outcome,
+            side=Side.SELL,
+            price=fill_price,
+            size=size,
+            cost=revenue,
+            fee=fee,
+            order_id=self._generate_order_id(),
+            exit_reason=exit_reason,
+            paper=True,
+        )
+        self.trade_history.append(result)
+        self.daily_trades += 1
+
+        logger.info(
+            f"PAPER SELL {outcome.value} @ ${fill_price:.4f} x {size:.2f} "
+            f"= ${net_revenue:.2f} (P/L: ${realized_pnl:.2f}) | Balance: ${self.balance:.2f}"
+        )
+        return result
+
+    def resolve_position(self, market_id: str, outcome: Outcome, resolution: str):
+        """Handle market resolution — payout 1.0 per share if correct, 0.0 if wrong."""
+        key = self._position_key(market_id, outcome)
+        pos = self.positions.get(key)
+        if not pos:
+            return
+
+        if outcome.value == resolution:
+            # Won — receive $1 per share
+            payout = pos.size
+            pnl = payout - pos.cost_basis
+        else:
+            # Lost — shares worth $0
+            payout = 0.0
+            pnl = -pos.cost_basis
+
+        self.balance += payout
+        self.daily_pnl += pnl
+
+        logger.info(
+            f"RESOLUTION {outcome.value} {'WON' if outcome.value == resolution else 'LOST'} "
+            f"| Payout: ${payout:.2f} | P/L: ${pnl:.2f} | Balance: ${self.balance:.2f}"
+        )
+
+        del self.positions[key]
+
+    def cancel(self, order_id: str) -> bool:
+        logger.info(f"PAPER CANCEL order {order_id}")
+        return True
+
+    def get_positions(self) -> list[Position]:
+        return list(self.positions.values())
+
+    def get_balance(self) -> float:
+        return self.balance
+
+    def get_order_book(self, token_id: str) -> Optional[OrderBook]:
+        # Paper mode generates a synthetic book
+        mid = 0.5
+        spread = 0.02
+        return OrderBook(
+            token_id=token_id,
+            bids=[
+                OrderBookLevel(price=mid - spread / 2, size=100),
+                OrderBookLevel(price=mid - spread, size=200),
+            ],
+            asks=[
+                OrderBookLevel(price=mid + spread / 2, size=100),
+                OrderBookLevel(price=mid + spread, size=200),
+            ],
+        )
+
+    def reset_daily(self):
+        """Reset daily tracking counters."""
+        self.daily_pnl = 0.0
+        self.daily_trades = 0
+
+    @property
+    def total_pnl(self) -> float:
+        return self.balance - self.initial_balance
+
+    @property
+    def open_exposure(self) -> float:
+        return sum(p.cost_basis for p in self.positions.values())
+
+    def summary(self) -> dict:
+        return {
+            "balance": round(self.balance, 2),
+            "initial_balance": self.initial_balance,
+            "total_pnl": round(self.total_pnl, 2),
+            "daily_pnl": round(self.daily_pnl, 2),
+            "daily_trades": self.daily_trades,
+            "open_positions": len(self.positions),
+            "open_exposure": round(self.open_exposure, 2),
+            "total_trades": len(self.trade_history),
+            "total_fees": round(self.total_fees, 2),
+        }
