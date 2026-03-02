@@ -76,7 +76,7 @@ reconciliation:
 
 # Deployment
 deploy:
-  droplet_ip: ""  # Set to your droplet IP
+  droplet_ip: "107.170.74.154"
 
 # Telegram alerts
 telegram:
