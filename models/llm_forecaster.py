@@ -26,7 +26,14 @@ Consider base rates, available evidence, and your uncertainty.
 
 IMPORTANT: Be specific about your probability estimate. Do NOT default to 50% unless you
 genuinely have no information. Markets already price in obvious information — your value
-comes from finding mispricings through careful analysis."""
+comes from finding mispricings through careful analysis.
+
+CALIBRATION RULES:
+- Provide probability to the nearest 1% (e.g., 23%, 67%, 41%)
+- Avoid round multiples of 5 or 10 unless evidence strongly supports exactly that value
+- Precise estimates like 23%, 67%, 41% are better than 25%, 65%, 40%
+- If a 1-in-20 chance, say 5%, not 10%
+- Start with the base rate, then adjust with quantified evidence"""
 
 PREDICTION_PROMPT_TEMPLATE = """Analyze this prediction market and estimate the probability of the specified outcome.
 
@@ -44,9 +51,13 @@ RESOLUTION DATE: {end_date}
 {context_section}
 
 Instructions:
-1. Consider all available evidence, base rates, and historical precedents
+1. Start with the base rate for this type of event, then adjust with quantified evidence
 2. Think about what information the market might be missing or overweighting
-3. Be specific — avoid anchoring to the current market price unless you agree with it
+3. Compare your estimate to the current market price of {market_price:.1%} and explain why you agree or disagree
+4. Be precise — use non-round probabilities (e.g., 23%, 67%, 41%) unless evidence specifically supports a round number
+
+CALIBRATION EXAMPLE:
+"Bitcoin will reach $X by date Y" — Base rate of crypto predictions: ~30% hit target. Current momentum is positive (+12% last month), but macro headwinds exist. Adjusted probability: 34%, not 30% or 35%.
 
 Respond in this exact JSON format:
 {{
@@ -54,7 +65,8 @@ Respond in this exact JSON format:
   "confidence": <float between 0.0 and 1.0 — how confident you are in your estimate>,
   "reasoning": "<2-3 sentence explanation of your key reasoning>",
   "key_factors": ["<factor 1>", "<factor 2>", "<factor 3>"],
-  "edge_direction": "<OVER if you think market underprices, UNDER if overprices, FAIR if roughly correct>"
+  "edge_direction": "<OVER if you think market underprices, UNDER if overprices, FAIR if roughly correct>",
+  "market_comparison": "<1 sentence: why your estimate differs from or agrees with the market price>"
 }}"""
 
 
@@ -150,12 +162,14 @@ class LLMForecaster(ProbabilityModel):
         screening_model: str = "claude-haiku-4-5-20251001",
         final_model: str = "claude-sonnet-4-5-20250929",
         cache_ttl: int = 3600,
+        screening_cache_ttl: int = 7200,
         max_daily_cost: float = 5.0,
     ):
         self.provider = provider
         self.screening_model = screening_model
         self.final_model = final_model
         self.cache_ttl = cache_ttl
+        self.screening_cache_ttl = screening_cache_ttl
         self.max_daily_cost = max_daily_cost
 
         self._cache: dict[str, tuple[float, dict]] = {}  # key -> (timestamp, result)
@@ -199,13 +213,15 @@ class LLMForecaster(ProbabilityModel):
 
         return self._client
 
-    def _cache_key(self, market_id: str, outcome: str, model: str) -> str:
-        return f"{market_id}:{outcome}:{model}"
+    def _cache_key(self, market_id: str, outcome: str, model: str, market_price: float = 0.0) -> str:
+        price_bucket = round(market_price / 0.05) * 0.05
+        return f"{market_id}:{outcome}:{model}:{price_bucket:.2f}"
 
-    def _get_cached(self, key: str) -> Optional[dict]:
+    def _get_cached(self, key: str, tier: str = "final") -> Optional[dict]:
         if key in self._cache:
             ts, result = self._cache[key]
-            if time.time() - ts < self.cache_ttl:
+            ttl = self.screening_cache_ttl if tier == "screening" else self.cache_ttl
+            if time.time() - ts < ttl:
                 return result
             del self._cache[key]
         return None
@@ -313,10 +329,11 @@ class LLMForecaster(ProbabilityModel):
             tier: 'screening' (cheap/fast) or 'final' (expensive/detailed)
         """
         model = self.screening_model if tier == "screening" else self.final_model
+        market_price = market.last_price_yes if outcome == Outcome.YES else market.last_price_no
 
-        # Check cache
-        cache_key = self._cache_key(market.condition_id, outcome.value, model)
-        cached = self._get_cached(cache_key)
+        # Check cache (includes price bucket so stale estimates invalidate on price moves)
+        cache_key = self._cache_key(market.condition_id, outcome.value, model, market_price)
+        cached = self._get_cached(cache_key, tier)
         if cached:
             logger.debug(f"Cache hit for {market.condition_id[:20]}... ({tier})")
             return ProbabilityEstimate(
@@ -360,7 +377,6 @@ class LLMForecaster(ProbabilityModel):
         )
 
         # Set market price for edge calculation
-        market_price = market.last_price_yes if outcome == Outcome.YES else market.last_price_no
         estimate.set_market_price(market_price)
 
         logger.info(

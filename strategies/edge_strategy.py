@@ -167,19 +167,26 @@ class EdgeStrategy:
     ) -> Optional[Signal]:
         """Check if an existing position should be exited.
 
-        Exit conditions:
-        1. Edge gone — model estimate moved or market moved to our price
-        2. Stop loss — position down > stop_loss_pct
-        3. Take profit — position up > take_profit_pct
-        4. Near resolution with uncertainty
+        Exit conditions (checked in order):
+        1. Edge gone — model edge < 40% of threshold
+        2. Edge decay — edge < 3% for 3 consecutive checks
+        3. Trailing stop — after 20%+ gain, exit if unrealized drops below 50% of peak
+        4. Dynamic stop loss — 20% for small-edge (<8%), 30% for large-edge
+        5. Time-based take profit — tightens as resolution approaches
+        6. Near resolution with uncertainty
         """
         market_price = market.last_price_yes if position.outcome == Outcome.YES else market.last_price_no
         position.update_pnl(market_price)
 
+        # Track peak unrealized P/L for trailing stop
+        if position.unrealized_pnl > position.peak_unrealized_pnl:
+            position.peak_unrealized_pnl = position.unrealized_pnl
+
         exit_reason = None
         exit_reasoning = ""
 
-        # 1. Check edge — re-run model
+        # 1. Edge gone — re-run model
+        current_edge = None
         estimate = self.model.predict(market, position.outcome, context)
         if estimate:
             current_edge = estimate.probability - market_price
@@ -190,21 +197,64 @@ class EdgeStrategy:
                     f"market={market_price:.1%} edge={current_edge:.1%}"
                 )
 
-        # 2. Stop loss — 30% loss
-        if not exit_reason and position.cost_basis > 0:
-            loss_pct = -position.unrealized_pnl / position.cost_basis
-            if loss_pct > 0.30:
-                exit_reason = ExitReason.STOP_LOSS
-                exit_reasoning = f"Stop loss: {loss_pct:.1%} loss (${position.unrealized_pnl:.2f})"
+        # 2. Edge decay — edge < 3% for 3 consecutive checks
+        if not exit_reason and current_edge is not None:
+            if current_edge < 0.03:
+                position.low_edge_consecutive += 1
+                if position.low_edge_consecutive >= 3:
+                    exit_reason = ExitReason.EDGE_DECAY
+                    exit_reasoning = (
+                        f"Edge decay: edge={current_edge:.1%} below 3% "
+                        f"for {position.low_edge_consecutive} consecutive checks"
+                    )
+            else:
+                position.low_edge_consecutive = 0
 
-        # 3. Take profit — 50% gain
+        # 3. Trailing stop — after 20%+ gain, trail at 50% of peak
         if not exit_reason and position.cost_basis > 0:
             gain_pct = position.unrealized_pnl / position.cost_basis
-            if gain_pct > 0.50:
-                exit_reason = ExitReason.TAKE_PROFIT
-                exit_reasoning = f"Take profit: {gain_pct:.1%} gain (${position.unrealized_pnl:.2f})"
+            peak_pct = position.peak_unrealized_pnl / position.cost_basis
+            if peak_pct > 0.20 and position.unrealized_pnl < position.peak_unrealized_pnl * 0.50:
+                exit_reason = ExitReason.TRAILING_STOP
+                exit_reasoning = (
+                    f"Trailing stop: peak=${position.peak_unrealized_pnl:.2f} "
+                    f"({peak_pct:.1%}), current=${position.unrealized_pnl:.2f} "
+                    f"({gain_pct:.1%}), below 50% of peak"
+                )
 
-        # 4. Near resolution with uncertainty
+        # 4. Dynamic stop loss — tighter for small-edge trades
+        if not exit_reason and position.cost_basis > 0:
+            loss_pct = -position.unrealized_pnl / position.cost_basis
+            # Small-edge trades (<8% entry edge) get tighter 20% stop
+            entry_edge = position.entry_price  # approximate; exact edge not stored
+            stop_threshold = 0.20 if (current_edge is not None and current_edge < 0.08) else 0.30
+            if loss_pct > stop_threshold:
+                exit_reason = ExitReason.STOP_LOSS
+                exit_reasoning = (
+                    f"Stop loss: {loss_pct:.1%} loss "
+                    f"(${position.unrealized_pnl:.2f}, threshold={stop_threshold:.0%})"
+                )
+
+        # 5. Time-based take profit — tightens approaching resolution
+        if not exit_reason and position.cost_basis > 0:
+            gain_pct = position.unrealized_pnl / position.cost_basis
+            hours = market.hours_to_resolution
+            # Tighten TP as resolution approaches
+            if hours is not None and hours < 24:
+                tp_threshold = 0.15
+            elif hours is not None and hours < 72:
+                tp_threshold = 0.30
+            else:
+                tp_threshold = 0.50
+            if gain_pct > tp_threshold:
+                exit_reason = ExitReason.TAKE_PROFIT
+                exit_reasoning = (
+                    f"Take profit: {gain_pct:.1%} gain "
+                    f"(${position.unrealized_pnl:.2f}, threshold={tp_threshold:.0%}"
+                    f"{f', {hours:.0f}h to resolution' if hours else ''})"
+                )
+
+        # 6. Near resolution with uncertainty
         if not exit_reason:
             hours = market.hours_to_resolution
             if hours is not None and hours < 6 and 0.25 < market_price < 0.75:
@@ -229,6 +279,7 @@ class EdgeStrategy:
             metadata={
                 "exit_reason": exit_reason.value,
                 "unrealized_pnl": position.unrealized_pnl,
+                "peak_unrealized_pnl": position.peak_unrealized_pnl,
                 "entry_price": position.entry_price,
                 "current_price": market_price,
             },

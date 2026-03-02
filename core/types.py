@@ -45,8 +45,10 @@ class StrategyType(Enum):
 
 class ExitReason(Enum):
     EDGE_GONE = "edge_gone"
+    EDGE_DECAY = "edge_decay"
     STOP_LOSS = "stop_loss"
     TAKE_PROFIT = "take_profit"
+    TRAILING_STOP = "trailing_stop"
     RESOLUTION = "resolution"
     NEAR_RESOLUTION = "near_resolution"
     MANUAL = "manual"
@@ -168,6 +170,8 @@ class Position:
     last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
+    peak_unrealized_pnl: float = 0.0
+    low_edge_consecutive: int = 0
 
     @property
     def market_value(self) -> float:

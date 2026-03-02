@@ -12,6 +12,7 @@ Key adaptations from Avellaneda-Stoikov for prediction markets:
 
 import logging
 import math
+from collections import defaultdict
 from typing import Optional
 
 from core.constants import (
@@ -73,6 +74,8 @@ class MarketMakerStrategy:
         self.max_existing_spread = max_existing_spread
         self.taper_start_hours = taper_start_hours
         self.taper_stop_hours = taper_stop_hours
+        self._price_history: dict[str, list[float]] = defaultdict(list)
+        self._max_price_history = 20
 
     @property
     def strategy_type(self) -> StrategyType:
@@ -117,8 +120,12 @@ class MarketMakerStrategy:
         inventory_delta = inventory / self.max_inventory if self.max_inventory > 0 else 0
         reservation = mid - inventory_delta * self.skew_factor * max(volatility, 0.01)
 
-        # 2. Optimal spread
+        # 2. Optimal spread (volume-weighted: tighter for high-volume markets)
         spread = self.base_spread + volatility * 0.5
+        if market.volume > 10000:
+            # Scale spread down for high-volume markets (0.7x at $100k+, 1.0x at $10k)
+            volume_factor = max(0.7, 1.0 - (market.volume - 10000) / 300000)
+            spread *= volume_factor
         spread = max(self.min_spread, min(self.max_spread, spread))
 
         # 3. Raw bid/ask
@@ -136,8 +143,8 @@ class MarketMakerStrategy:
         if bid >= ask:
             return []
 
-        # 5. Resolution taper — reduce size near expiry
-        size = self._tapered_size(market)
+        # 5. Dynamic quote sizing
+        size = self._dynamic_size(market, inventory)
         if size < 1:
             return []
 
@@ -235,8 +242,27 @@ class MarketMakerStrategy:
 
         return True
 
+    def record_price(self, market_id: str, price: float):
+        """Record a price observation for historical volatility calculation."""
+        history = self._price_history[market_id]
+        history.append(price)
+        if len(history) > self._max_price_history:
+            self._price_history[market_id] = history[-self._max_price_history:]
+
     def _estimate_volatility(self, book: OrderBook) -> float:
-        """Estimate short-term volatility from order book spread."""
+        """Estimate short-term volatility from price history or order book spread."""
+        history = self._price_history.get(book.token_id, [])
+        if len(history) >= 3:
+            # Calculate std dev of returns from price history
+            returns = []
+            for i in range(1, len(history)):
+                if history[i - 1] > 0:
+                    returns.append((history[i] - history[i - 1]) / history[i - 1])
+            if returns:
+                mean = sum(returns) / len(returns)
+                variance = sum((r - mean) ** 2 for r in returns) / len(returns)
+                return max(0.01, variance ** 0.5)
+        # Fallback to book spread
         return book.spread / 2
 
     def _apply_boundary_safety(self, bid: float, ask: float) -> tuple[float, float]:
@@ -255,22 +281,29 @@ class MarketMakerStrategy:
 
         return bid, ask
 
-    def _tapered_size(self, market: Market) -> int:
-        """Linearly reduce quote size as resolution approaches.
+    def _dynamic_size(self, market: Market, inventory: int = 0) -> int:
+        """Calculate quote size based on liquidity, resolution, and inventory.
 
-        Full size at taper_start_hours (168h / 1 week).
-        Zero size at taper_stop_hours (48h / 2 days).
+        Factors:
+        1. Liquidity-scaled base size
+        2. Resolution taper (linear reduction near expiry)
+        3. Inventory reduction (reduce as inventory grows)
         """
+        # 1. Liquidity-scaled base: scale with market liquidity
+        base = max(5, min(100, int(market.liquidity / 100)))
+
+        # 2. Resolution taper
         hours = market.hours_to_resolution
-        if hours is None:
-            return self.quote_size  # No end date — full size
+        if hours is not None:
+            if hours <= self.taper_stop_hours:
+                return 0
+            if hours < self.taper_start_hours:
+                fraction = (hours - self.taper_stop_hours) / (self.taper_start_hours - self.taper_stop_hours)
+                base = max(1, int(base * fraction))
 
-        if hours <= self.taper_stop_hours:
-            return 0
+        # 3. Inventory reduction: reduce size as inventory grows
+        if self.max_inventory > 0 and inventory != 0:
+            inv_fraction = abs(inventory) / self.max_inventory
+            base = max(1, int(base * (1 - inv_fraction * 0.5)))
 
-        if hours >= self.taper_start_hours:
-            return self.quote_size
-
-        # Linear interpolation
-        fraction = (hours - self.taper_stop_hours) / (self.taper_start_hours - self.taper_stop_hours)
-        return max(1, int(self.quote_size * fraction))
+        return base

@@ -16,11 +16,12 @@ scan:
 
 # Risk limits
 risk:
-  max_position_size: 100  # USDC per position
+  bankroll: 10000  # USDC
+  max_position_size: 200  # USDC per position
   max_positions: 10
-  max_daily_loss: 50  # USDC
+  max_daily_loss: 500  # USDC
   max_consecutive_losses: 3
-  max_exposure_pct: 0.25  # 25% of bankroll
+  max_exposure_pct: 0.50  # 50% of bankroll
   kelly_fraction: 0.25  # Quarter Kelly
   min_hours_to_resolution: 24
 
@@ -61,8 +62,8 @@ arbitrage:
 
 # Strategy coordinator
 coordinator:
-  max_mm_markets: 5
-  max_mm_exposure: 300   # USDC
+  max_mm_markets: 10
+  max_mm_exposure: 500   # USDC
   max_arb_exposure: 200  # USDC
 
 # WebSocket price streaming

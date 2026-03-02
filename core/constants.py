@@ -30,10 +30,10 @@ NEWS_POLL_INTERVAL = 900  # 15 min
 HEARTBEAT_INTERVAL = 3600  # 1 hour
 
 # Risk defaults
-DEFAULT_MAX_POSITION_SIZE = 100.0  # USDC
+DEFAULT_MAX_POSITION_SIZE = 200.0  # USDC
 DEFAULT_MAX_POSITIONS = 10
-DEFAULT_MAX_DAILY_LOSS = 50.0  # USDC
-DEFAULT_MAX_EXPOSURE_PCT = 0.25  # 25% of bankroll
+DEFAULT_MAX_DAILY_LOSS = 500.0  # USDC
+DEFAULT_MAX_EXPOSURE_PCT = 0.50  # 50% of bankroll
 DEFAULT_KELLY_FRACTION = 0.25  # Quarter Kelly
 DEFAULT_MIN_EDGE = 0.05  # 5%
 DEFAULT_MIN_CONFIDENCE = 0.6
@@ -52,8 +52,8 @@ MM_MAX_SPREAD = 0.15  # Maximum spread
 MM_MAX_INVENTORY = 200  # Max shares per side
 MM_QUOTE_SIZE = 20  # Shares per quote
 MM_BOUNDARY_BUFFER = 0.08  # Widen spread near 0/1
-MM_MAX_MM_MARKETS = 5  # Max simultaneous MM markets
-MM_MAX_MM_EXPOSURE = 300.0  # USDC total MM exposure
+MM_MAX_MM_MARKETS = 10  # Max simultaneous MM markets
+MM_MAX_MM_EXPOSURE = 500.0  # USDC total MM exposure
 
 # Arbitrage defaults
 ARB_MIN_PROFIT_BPS = 50  # Min profit in basis points (0.5%)

@@ -58,6 +58,7 @@ from runners.notifier import TelegramNotifier
 from strategies.arbitrage import ArbitrageStrategy
 from strategies.coordinator import StrategyCoordinator
 from strategies.edge_strategy import EdgeStrategy
+from data.sources.news_feed import NewsFeed
 from strategies.market_maker import MarketMakerStrategy
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,11 @@ class LiveTrader:
 
         # Bridge health tracking (live mode only)
         self._bridge_degraded = False
+
+        # News feed for LLM context
+        self.news_feed = NewsFeed()
+        self._news_cache: dict[str, tuple[float, list]] = {}  # market_id -> (timestamp, articles)
+        self._news_cache_ttl = scan_cfg.get("news_poll", 900)  # 15 min
 
         # Watched markets (candidates for trading)
         self._watched_markets: list[str] = []
@@ -376,6 +382,26 @@ class LiveTrader:
         # Active orders
         context["active_orders"] = self.executor.get_open_orders(market.condition_id)
 
+        # Fetch news (with cache per market)
+        try:
+            cached = self._news_cache.get(market.condition_id)
+            if cached and time.time() - cached[0] < self._news_cache_ttl:
+                articles = cached[1]
+            else:
+                articles = self.news_feed.search_market_news(market.question, max_items=5)
+                self._news_cache[market.condition_id] = (time.time(), articles)
+            if articles:
+                context["news"] = articles
+        except Exception:
+            pass
+
+        # Market metadata for LLM
+        context["additional_context"] = (
+            f"Volume: ${market.volume:,.0f} | "
+            f"Liquidity: ${market.liquidity:,.0f} | "
+            f"Spread: {market.spread_yes:.1%}"
+        )
+
         return context
 
     def _price_update_and_evaluate(self):
@@ -395,6 +421,9 @@ class LiveTrader:
             market = self.cache.get_market(cid)
             if not market:
                 continue
+
+            # Feed price to MM for historical volatility tracking
+            self.mm_strategy.record_price(cid, market.last_price_yes)
 
             # Fall back to REST if WS didn't provide an update for this market
             ws_had_update = (
@@ -861,7 +890,7 @@ def main():
     parser = argparse.ArgumentParser(description="Polymarket Trading Bot")
     parser.add_argument("--paper", action="store_true", help="Paper trading mode (default)")
     parser.add_argument("--live", action="store_true", help="Live trading mode")
-    parser.add_argument("--bankroll", type=float, default=1000.0, help="Starting bankroll in USDC")
+    parser.add_argument("--bankroll", type=float, default=None, help="Starting bankroll in USDC (default: from settings)")
     parser.add_argument("--min-edge", type=float, default=None, help="Override min edge (e.g., 0.05)")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     args = parser.parse_args()
@@ -883,9 +912,11 @@ def main():
     if args.min_edge is not None:
         settings.setdefault("strategy", {})["min_edge"] = args.min_edge
 
+    bankroll = args.bankroll or settings.get("risk", {}).get("bankroll", 10000.0)
+
     trader = LiveTrader(
         mode=mode,
-        bankroll=args.bankroll,
+        bankroll=bankroll,
         settings=settings,
     )
 
