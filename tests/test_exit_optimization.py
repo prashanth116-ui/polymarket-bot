@@ -296,10 +296,56 @@ def test_edge_gone_takes_priority():
     market = _make_market(price_yes=0.50)
 
     pos = _make_position(entry_price=0.50, size=20, cost_basis=10.0)
+    # Simulate position held for 15 minutes (past min_hold_minutes)
+    pos.opened_at = datetime.now(timezone.utc) - timedelta(minutes=15)
 
+    # First check: increments edge_gone_consecutive to 1
+    signal = strategy.check_exit(market, pos)
+    assert signal is None  # Not enough consecutive checks yet
+    assert pos.edge_gone_consecutive == 1
+
+    # Second check: triggers edge_gone (2 consecutive + held long enough)
+    strategy._exit_cache.clear()
     signal = strategy.check_exit(market, pos)
     assert signal is not None
     assert signal.metadata["exit_reason"] == ExitReason.EDGE_GONE.value
+
+
+def test_edge_gone_not_triggered_within_hold_time():
+    """Edge gone should NOT trigger if position is too young."""
+    model = StubModel(prob=0.35)  # Way below market
+    strategy = EdgeStrategy(model, min_edge=0.05, bankroll=1000)
+    market = _make_market(price_yes=0.50)
+
+    pos = _make_position(entry_price=0.50, size=20, cost_basis=10.0)
+    # Position just opened — within min_hold_minutes (default 10 min)
+
+    # Even with 2 consecutive checks, should not trigger within hold time
+    strategy.check_exit(market, pos)
+    strategy._exit_cache.clear()
+    signal = strategy.check_exit(market, pos)
+    assert signal is None
+    assert pos.edge_gone_consecutive == 2
+
+
+def test_edge_gone_resets_on_recovery():
+    """Edge_gone counter should reset when edge recovers."""
+    model = StubModel(prob=0.35)
+    strategy = EdgeStrategy(model, min_edge=0.05, bankroll=1000)
+    market = _make_market(price_yes=0.50)
+
+    pos = _make_position(entry_price=0.50, size=20, cost_basis=10.0)
+    pos.opened_at = datetime.now(timezone.utc) - timedelta(minutes=15)
+
+    # First check: edge_gone_consecutive = 1
+    strategy.check_exit(market, pos)
+    assert pos.edge_gone_consecutive == 1
+
+    # Edge recovers
+    model._prob = 0.65  # Good edge again
+    strategy._exit_cache.clear()
+    strategy.check_exit(market, pos)
+    assert pos.edge_gone_consecutive == 0
 
 
 if __name__ == "__main__":

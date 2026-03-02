@@ -149,9 +149,13 @@ class LiveTrader:
             max_exposure_per_category=bankroll * risk_cfg.get("max_category_exposure_pct", 0.40),
             max_consecutive_losses=risk_cfg.get("max_consecutive_losses", 3),
             max_position_size=risk_cfg.get("max_position_size", DEFAULT_MAX_POSITION_SIZE),
+            max_positions_per_category=risk_cfg.get("max_positions_per_category", 3),
+            max_correlated_positions=risk_cfg.get("max_correlated_positions", 2),
+            max_same_outcome_per_category=risk_cfg.get("max_same_outcome_per_category", 2),
         )
 
         self.portfolio = Portfolio()
+        self.risk_manager.set_portfolio(self.portfolio)
         self.sizer = PositionSizer(
             bankroll=bankroll,
             kelly_mult=risk_cfg.get("kelly_fraction", DEFAULT_KELLY_FRACTION),

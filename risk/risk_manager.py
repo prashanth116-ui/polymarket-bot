@@ -1,14 +1,18 @@
 """Risk manager — circuit breakers, daily limits, kill switch.
 
 Enforces position limits, daily loss caps, consecutive loss stops,
-and a manual kill switch. All checks must pass before a trade is allowed.
+correlated position limits, directional diversity, and a manual kill switch.
+All checks must pass before a trade is allowed.
 """
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from core.types import Market, Signal, StrategyType
+
+if TYPE_CHECKING:
+    from risk.portfolio import Portfolio
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +29,10 @@ class RiskManager:
         max_consecutive_losses: int = 3,
         min_hours_to_resolution: float = 24.0,
         max_position_size: float = 100.0,
+        max_positions_per_category: int = 3,
+        max_correlated_positions: int = 2,
+        max_same_outcome_per_category: int = 2,
+        portfolio: "Portfolio" = None,
     ):
         self.max_daily_loss = max_daily_loss
         self.max_positions = max_positions
@@ -33,6 +41,10 @@ class RiskManager:
         self.max_consecutive_losses = max_consecutive_losses
         self.min_hours_to_resolution = min_hours_to_resolution
         self.max_position_size = max_position_size
+        self.max_positions_per_category = max_positions_per_category
+        self.max_correlated_positions = max_correlated_positions
+        self.max_same_outcome_per_category = max_same_outcome_per_category
+        self._portfolio = portfolio
 
         # State
         self._daily_pnl: float = 0.0
@@ -91,7 +103,42 @@ class RiskManager:
         if hours is not None and hours < self.min_hours_to_resolution:
             return False, f"Too close to resolution ({hours:.1f}h < {self.min_hours_to_resolution:.1f}h)"
 
+        # Portfolio-based checks (correlated positions, directional diversity)
+        if self._portfolio:
+            category = market.category or "other"
+
+            # Per-category position count limit
+            cat_positions = self._portfolio.positions_in_category(category)
+            if len(cat_positions) >= self.max_positions_per_category:
+                return False, (
+                    f"Category '{category}' position limit "
+                    f"({len(cat_positions)}/{self.max_positions_per_category})"
+                )
+
+            # Correlated position limit (same topic/keywords)
+            correlated = self._portfolio.find_correlated(market)
+            if len(correlated) >= self.max_correlated_positions:
+                return False, (
+                    f"Correlated position limit "
+                    f"({len(correlated)}/{self.max_correlated_positions})"
+                )
+
+            # Directional diversity — max same outcome per category
+            outcome_count = self._portfolio.count_outcome_in_category(
+                category, signal.outcome,
+            )
+            if outcome_count >= self.max_same_outcome_per_category:
+                return False, (
+                    f"Same-outcome limit in '{category}': "
+                    f"{outcome_count} {signal.outcome.value} bets "
+                    f"(max {self.max_same_outcome_per_category})"
+                )
+
         return True, "OK"
+
+    def set_portfolio(self, portfolio: "Portfolio"):
+        """Wire portfolio for correlated/directional checks."""
+        self._portfolio = portfolio
 
     def record_trade_open(self, size: float, category: str = "other"):
         """Record a new position being opened."""

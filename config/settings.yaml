@@ -25,6 +25,9 @@ risk:
   max_category_exposure_pct: 0.40  # 40% of bankroll per category
   kelly_fraction: 0.25  # Quarter Kelly
   min_hours_to_resolution: 24
+  max_positions_per_category: 3   # Max open positions in one category
+  max_correlated_positions: 2     # Max positions in correlated markets (same topic/keywords)
+  max_same_outcome_per_category: 2  # Max same-outcome bets per category (prevents all-NO bias)
 
 # Strategy defaults
 strategy:
@@ -38,6 +41,8 @@ exits:
   trailing_stop_retracement: 0.50  # Exit if unrealized drops below 50% of peak
   stop_loss_tight: 0.20  # Stop loss for small-edge trades (<8%)
   stop_loss_wide: 0.30   # Stop loss for large-edge trades (>=8%)
+  edge_gone_checks: 2    # Consecutive checks with edge < 40% threshold before edge_gone exit
+  min_hold_minutes: 10   # Minimum hold time (minutes) before edge_gone exit allowed
   edge_decay_threshold: 0.03  # Edge must stay above 3%
   edge_decay_checks: 3   # Consecutive checks below threshold before exit
   tp_near_hours: 24      # Hours to resolution: near

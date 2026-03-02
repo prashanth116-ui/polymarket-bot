@@ -127,6 +127,24 @@ class Portfolio:
         """How much more exposure can we take before hitting the cap."""
         return max(0, max_exposure - self.total_exposure)
 
+    def positions_in_category(self, category: str) -> list[Position]:
+        """Get all open positions in a specific category."""
+        result = []
+        for pos in self._positions.values():
+            meta = self._market_metadata.get(pos.market_id, {})
+            if meta.get("category", "other") == category:
+                result.append(pos)
+        return result
+
+    def count_outcome_in_category(self, category: str, outcome: Outcome) -> int:
+        """Count how many positions have a specific outcome in a category."""
+        count = 0
+        for pos in self._positions.values():
+            meta = self._market_metadata.get(pos.market_id, {})
+            if meta.get("category", "other") == category and pos.outcome == outcome:
+                count += 1
+        return count
+
     def remaining_category_exposure(self, category: str, max_per_category: float) -> float:
         """How much more exposure we can take in a specific category."""
         current = self.exposure_by_category().get(category, 0.0)

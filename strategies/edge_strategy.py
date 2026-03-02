@@ -74,6 +74,10 @@ class EdgeStrategy:
         self.tp_mid_pct = ec.get("tp_mid_pct", 0.30)
         self.tp_far_pct = ec.get("tp_far_pct", 0.50)
 
+        # Edge gone settings
+        self.edge_gone_checks = ec.get("edge_gone_checks", 2)  # Consecutive checks before exit
+        self.min_hold_minutes = ec.get("min_hold_minutes", 10)  # Minutes before edge_gone allowed
+
         # Exit prediction cache (avoid re-calling LLM every minute for same market)
         self._exit_cache: dict[str, tuple[float, ProbabilityEstimate]] = {}
         self._exit_cache_ttl = 120  # seconds — cache exit predictions for 2 min
@@ -225,6 +229,7 @@ class EdgeStrategy:
         exit_reasoning = ""
 
         # 1. Edge gone — re-run model (with 2-min cache to reduce API calls)
+        #    Requires consecutive checks AND minimum hold time before exiting
         current_edge = None
         cache_key = f"{market.condition_id}:{position.outcome.value}"
         cached = self._exit_cache.get(cache_key)
@@ -237,11 +242,28 @@ class EdgeStrategy:
         if estimate:
             current_edge = estimate.probability - market_price
             if current_edge < self.min_edge * 0.4:  # Edge less than 40% of min threshold
-                exit_reason = ExitReason.EDGE_GONE
-                exit_reasoning = (
-                    f"Edge gone: model={estimate.probability:.1%} "
-                    f"market={market_price:.1%} edge={current_edge:.1%}"
-                )
+                position.edge_gone_consecutive += 1
+
+                # Check minimum hold time
+                hold_minutes = (datetime.now(timezone.utc) - position.opened_at).total_seconds() / 60
+
+                if (position.edge_gone_consecutive >= self.edge_gone_checks
+                        and hold_minutes >= self.min_hold_minutes):
+                    exit_reason = ExitReason.EDGE_GONE
+                    exit_reasoning = (
+                        f"Edge gone: model={estimate.probability:.1%} "
+                        f"market={market_price:.1%} edge={current_edge:.1%} "
+                        f"({position.edge_gone_consecutive} consecutive checks, "
+                        f"held {hold_minutes:.0f}min)"
+                    )
+                else:
+                    logger.debug(
+                        f"Edge low but waiting: edge={current_edge:.1%} "
+                        f"checks={position.edge_gone_consecutive}/{self.edge_gone_checks} "
+                        f"hold={hold_minutes:.0f}/{self.min_hold_minutes}min"
+                    )
+            else:
+                position.edge_gone_consecutive = 0  # Reset when edge recovers
 
         # 2. Edge decay — edge below threshold for N consecutive checks
         if not exit_reason and current_edge is not None:
