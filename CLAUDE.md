@@ -76,11 +76,42 @@ python run_paper_trading.py
 | `data/sources/news_feed.py` | NewsAPI + RSS news aggregation |
 | `data/sources/economic_data.py` | FRED API economic indicators |
 | `data/sources/polls.py` | RCP/538 polling data |
+| `models/base.py` | Abstract ProbabilityModel base class |
+| `models/llm_forecaster.py` | LLM forecaster (Claude/GPT-4, 2-tier with caching) |
+| `models/statistical.py` | MarketImplied, BaseRate, TimeDecay models |
+| `models/ensemble.py` | Weighted multi-model aggregator (Brier-based weights) |
+| `models/calibration.py` | Brier score tracking + calibration curves |
+| `strategies/base.py` | Abstract Strategy base class |
+| `strategies/edge_strategy.py` | Edge strategy (buy when model > market + min_edge) |
 | `runners/notifier.py` | Telegram alerts |
 | `runners/market_monitor.py` | CLI market watcher tool |
 | `bridge/src/index.ts` | Express server (port 8420) |
 | `health_check.py` | Import, config, API connectivity checks |
 | `run_paper_trading.py` | 24/7 wrapper with auto-restart |
+
+## Strategy Pipeline
+```
+Market Scanner → Filter by volume/liquidity → Ensemble Model → Edge Detection → Signal
+                                                  ↓
+                                    MarketImplied + BaseRate + TimeDecay + LLM
+                                                  ↓
+                                    Weighted average (Brier-based weights)
+                                                  ↓
+                                    Edge = model_prob - market_price
+                                    If edge >= 5%: generate Signal with Kelly sizing
+```
+
+### LLM Forecaster Tiers
+| Tier | Model | Use Case | Cache |
+|------|-------|----------|-------|
+| Screening | Haiku/GPT-4o-mini | Quick filter — skip no-edge markets | 1 hour |
+| Final | Sonnet/GPT-4 | Detailed analysis for edge candidates | 1 hour |
+
+### Edge Strategy Exit Conditions
+1. **Edge gone**: model estimate moved or market moved to our price (edge < 2%)
+2. **Stop loss**: position down > 30%
+3. **Take profit**: position up > 50%
+4. **Near resolution**: < 6h to resolution with uncertain price (25-75%)
 
 ## Environment Variables
 Set in `config/.env` (gitignored):
