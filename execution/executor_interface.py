@@ -4,10 +4,12 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 from core.types import (
+    OpenOrder,
     OrderBook,
     Outcome,
     Position,
     Side,
+    StrategyType,
     TradeResult,
 )
 
@@ -68,4 +70,36 @@ class ExecutorInterface(ABC):
     @abstractmethod
     def get_order_book(self, token_id: str) -> Optional[OrderBook]:
         """Get order book for a token."""
+        ...
+
+    @abstractmethod
+    def place_limit_order(
+        self,
+        market_id: str,
+        token_id: str,
+        outcome: Outcome,
+        side: Side,
+        price: float,
+        size: float,
+        strategy: StrategyType = StrategyType.MARKET_MAKING,
+    ) -> Optional[str]:
+        """Place a resting limit order.
+
+        Returns:
+            Order ID if placed, None on failure
+        """
+        ...
+
+    @abstractmethod
+    def get_open_orders(self, market_id: str = None) -> list[OpenOrder]:
+        """Get open (resting) orders, optionally filtered by market."""
+        ...
+
+    @abstractmethod
+    def cancel_all_orders(self, market_id: str = None) -> int:
+        """Cancel all open orders, optionally filtered by market.
+
+        Returns:
+            Number of orders cancelled
+        """
         ...

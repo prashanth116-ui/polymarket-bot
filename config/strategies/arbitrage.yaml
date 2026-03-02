@@ -1,0 +1,13 @@
+# Arbitrage Strategy Configuration
+name: arbitrage
+enabled: true
+
+# Minimum profit after fees (basis points)
+min_profit_bps: 50  # 0.5% guaranteed profit minimum
+
+# Position limits
+max_position: 100  # USDC per arb opportunity
+max_exposure: 200  # USDC total arb exposure
+
+# Fees
+taker_fee_bps: 200  # 2% taker fee (both legs are market orders)

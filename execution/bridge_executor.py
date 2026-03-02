@@ -7,11 +7,14 @@ import requests
 
 from core.constants import DEFAULT_BRIDGE_URL, TAKER_FEE_BPS
 from core.types import (
+    OpenOrder,
     OrderBook,
     OrderBookLevel,
+    OrderStatus,
     Outcome,
     Position,
     Side,
+    StrategyType,
     TradeResult,
 )
 from execution.executor_interface import ExecutorInterface
@@ -128,3 +131,65 @@ class BridgeExecutor(ExecutorInterface):
         except Exception:
             logger.error(f"Failed to get book for {token_id}")
             return None
+
+    def place_limit_order(
+        self,
+        market_id: str,
+        token_id: str,
+        outcome: Outcome,
+        side: Side,
+        price: float,
+        size: float,
+        strategy: StrategyType = StrategyType.MARKET_MAKING,
+    ) -> Optional[str]:
+        """Place a GTC limit order via the bridge."""
+        try:
+            data = self._request("post", "/order", json={
+                "token_id": token_id,
+                "price": price,
+                "size": size,
+                "side": side.value,
+                "type": "GTC",
+            })
+            return data.get("order_id")
+        except Exception:
+            logger.error(f"Failed to place limit order for {token_id}")
+            return None
+
+    def get_open_orders(self, market_id: str = None) -> list[OpenOrder]:
+        """Get open orders from the bridge."""
+        try:
+            data = self._request("get", "/orders")
+            orders = []
+            for o in data.get("orders", []):
+                orders.append(OpenOrder(
+                    order_id=o["order_id"],
+                    market_id=o.get("market_id", ""),
+                    token_id=o["token_id"],
+                    outcome=Outcome(o.get("outcome", "YES")),
+                    side=Side(o["side"]),
+                    price=o["price"],
+                    size=o["size"],
+                    filled_size=o.get("filled_size", 0.0),
+                    status=OrderStatus(o.get("status", "open")),
+                ))
+            if market_id:
+                orders = [o for o in orders if o.market_id == market_id]
+            return orders
+        except Exception:
+            logger.error("Failed to get open orders")
+            return []
+
+    def cancel_all_orders(self, market_id: str = None) -> int:
+        """Cancel all open orders via the bridge."""
+        try:
+            params = {}
+            if market_id:
+                params["market_id"] = market_id
+            data = self._request("delete", "/orders", params=params)
+            cancelled = data.get("cancelled", 0)
+            logger.info(f"Cancelled {cancelled} orders via bridge")
+            return cancelled
+        except Exception:
+            logger.error("Failed to cancel orders")
+            return 0

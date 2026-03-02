@@ -26,6 +26,18 @@ def check_imports():
         from data.sources.news_feed import NewsFeed
         from data.sources.economic_data import EconomicDataFeed
         from data.sources.polls import PollsFeed
+        from models.base import ProbabilityModel
+        from models.ensemble import EnsembleModel
+        from models.statistical import MarketImpliedModel, BaseRateModel, TimeDecayModel
+        from models.calibration import CalibrationTracker
+        from strategies.edge_strategy import EdgeStrategy
+        from strategies.arbitrage import ArbitrageStrategy
+        from strategies.market_maker import MarketMakerStrategy
+        from strategies.coordinator import StrategyCoordinator
+        from risk.risk_manager import RiskManager
+        from risk.position_sizer import PositionSizer
+        from risk.portfolio import Portfolio
+        from runners.run_live import LiveTrader
         print("  All imports OK")
         return True
     except ImportError as e:

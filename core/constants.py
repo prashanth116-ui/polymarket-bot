@@ -44,3 +44,18 @@ MIN_VOLUME_24H = 100.0  # USDC
 MIN_HOURS_TO_RESOLUTION = 24  # Don't trade markets resolving within 24h
 MAX_PRICE_FOR_BUY = 0.95  # Don't buy above 95 cents
 MIN_PRICE_FOR_BUY = 0.05  # Don't buy below 5 cents
+
+# Market Making defaults
+MM_MIN_SPREAD = 0.04  # Minimum spread to quote
+MM_BASE_SPREAD = 0.06  # Base spread before adjustments
+MM_MAX_SPREAD = 0.15  # Maximum spread
+MM_MAX_INVENTORY = 200  # Max shares per side
+MM_QUOTE_SIZE = 20  # Shares per quote
+MM_BOUNDARY_BUFFER = 0.08  # Widen spread near 0/1
+MM_MAX_MM_MARKETS = 5  # Max simultaneous MM markets
+MM_MAX_MM_EXPOSURE = 300.0  # USDC total MM exposure
+
+# Arbitrage defaults
+ARB_MIN_PROFIT_BPS = 50  # Min profit in basis points (0.5%)
+ARB_MAX_POSITION = 100  # Max USDC per arb
+ARB_MAX_ARB_EXPOSURE = 200.0  # USDC total arb exposure

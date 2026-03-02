@@ -42,6 +42,29 @@ filters:
     - science
     - economics
 
+# Market Making
+market_maker:
+  enabled: true
+  base_spread: 0.06
+  min_spread: 0.04
+  max_spread: 0.15
+  max_inventory: 200
+  quote_size: 20
+  boundary_buffer: 0.08
+  min_liquidity: 500
+
+# Arbitrage
+arbitrage:
+  enabled: true
+  min_profit_bps: 50  # 0.5% minimum profit
+  max_position: 100   # USDC per arb
+
+# Strategy coordinator
+coordinator:
+  max_mm_markets: 5
+  max_mm_exposure: 300   # USDC
+  max_arb_exposure: 200  # USDC
+
 # Telegram alerts
 telegram:
   enabled: false

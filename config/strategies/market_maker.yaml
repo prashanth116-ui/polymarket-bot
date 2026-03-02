@@ -1,0 +1,29 @@
+# Market Maker Strategy Configuration
+name: market_maker
+enabled: true
+
+# Spread parameters
+base_spread: 0.06      # Base spread before adjustments
+min_spread: 0.04       # Minimum spread to quote
+max_spread: 0.15       # Maximum spread
+
+# Inventory
+max_inventory: 200     # Max shares per side
+quote_size: 20         # Shares per quote
+
+# Safety
+boundary_buffer: 0.08  # Widen spread near 0/1 boundaries
+skew_factor: 0.01      # Inventory skew intensity
+
+# Filters
+min_liquidity: 500     # USDC minimum market liquidity
+min_book_depth: 100    # Minimum order book depth
+max_existing_spread: 0.20  # Skip markets with huge spreads
+
+# Resolution taper
+taper_start_hours: 168  # Start reducing at 7 days
+taper_stop_hours: 48    # Stop quoting at 2 days
+
+# Exposure limits
+max_mm_markets: 5      # Max simultaneous MM markets
+max_mm_exposure: 300   # USDC total MM exposure

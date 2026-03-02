@@ -8,8 +8,10 @@ from typing import Optional
 from core.constants import TAKER_FEE_BPS
 from core.types import (
     ExitReason,
+    OpenOrder,
     OrderBook,
     OrderBookLevel,
+    OrderStatus,
     Outcome,
     Position,
     Side,
@@ -40,6 +42,7 @@ class PaperExecutor(ExecutorInterface):
         self.daily_pnl = 0.0
         self.daily_trades = 0
         self._next_order_id = 1
+        self.open_orders: dict[str, OpenOrder] = {}  # order_id -> OpenOrder
 
     def _position_key(self, market_id: str, outcome: Outcome) -> str:
         return f"{market_id}:{outcome.value}"
@@ -229,6 +232,113 @@ class PaperExecutor(ExecutorInterface):
                 OrderBookLevel(price=mid + spread, size=200),
             ],
         )
+
+    def place_limit_order(
+        self,
+        market_id: str,
+        token_id: str,
+        outcome: Outcome,
+        side: Side,
+        price: float,
+        size: float,
+        strategy: StrategyType = StrategyType.MARKET_MAKING,
+    ) -> Optional[str]:
+        """Place a resting limit order (simulated)."""
+        order_id = self._generate_order_id()
+        order = OpenOrder(
+            order_id=order_id,
+            market_id=market_id,
+            token_id=token_id,
+            outcome=outcome,
+            side=side,
+            price=price,
+            size=size,
+            strategy=strategy,
+        )
+        self.open_orders[order_id] = order
+        logger.info(
+            f"PAPER LIMIT {side.value} {outcome.value} @ ${price:.4f} x {size:.1f} "
+            f"(order {order_id})"
+        )
+        return order_id
+
+    def check_limit_fills(self, token_id: str, current_price: float) -> list[TradeResult]:
+        """Check if any resting orders should fill at the current price.
+
+        BUY fills if current_price <= order.price
+        SELL fills if current_price >= order.price
+        """
+        filled = []
+        to_remove = []
+
+        for oid, order in self.open_orders.items():
+            if order.token_id != token_id or not order.is_active:
+                continue
+
+            should_fill = (
+                (order.side == Side.BUY and current_price <= order.price) or
+                (order.side == Side.SELL and current_price >= order.price)
+            )
+
+            if not should_fill:
+                continue
+
+            # Execute the fill — maker fee (0 bps)
+            fill_size = order.remaining_size
+            if order.side == Side.BUY:
+                result = self.buy(
+                    market_id=order.market_id,
+                    token_id=order.token_id,
+                    outcome=order.outcome,
+                    price=order.price,
+                    size=fill_size,
+                    strategy=order.strategy,
+                )
+            else:
+                result = self.sell(
+                    market_id=order.market_id,
+                    token_id=order.token_id,
+                    outcome=order.outcome,
+                    price=order.price,
+                    size=fill_size,
+                )
+
+            order.filled_size = order.size
+            order.status = OrderStatus.FILLED
+            to_remove.append(oid)
+            filled.append(result)
+
+            logger.info(f"LIMIT FILL {order.side.value} {order.outcome.value} @ ${order.price:.4f} x {fill_size:.1f}")
+
+        for oid in to_remove:
+            del self.open_orders[oid]
+
+        return filled
+
+    def get_open_orders(self, market_id: str = None) -> list[OpenOrder]:
+        """Get all active resting orders."""
+        orders = [o for o in self.open_orders.values() if o.is_active]
+        if market_id:
+            orders = [o for o in orders if o.market_id == market_id]
+        return orders
+
+    def cancel_all_orders(self, market_id: str = None) -> int:
+        """Cancel all resting orders, optionally for a specific market."""
+        to_cancel = []
+        for oid, order in self.open_orders.items():
+            if not order.is_active:
+                continue
+            if market_id and order.market_id != market_id:
+                continue
+            to_cancel.append(oid)
+
+        for oid in to_cancel:
+            self.open_orders[oid].status = OrderStatus.CANCELLED
+            del self.open_orders[oid]
+
+        if to_cancel:
+            logger.info(f"Cancelled {len(to_cancel)} orders" + (f" for {market_id}" if market_id else ""))
+        return len(to_cancel)
 
     def reset_daily(self):
         """Reset daily tracking counters."""

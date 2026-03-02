@@ -51,6 +51,17 @@ class ExitReason(Enum):
     NEAR_RESOLUTION = "near_resolution"
     MANUAL = "manual"
     RISK_LIMIT = "risk_limit"
+    ARBITRAGE = "arbitrage"
+    MM_INVENTORY = "mm_inventory"
+
+
+class OrderStatus(Enum):
+    PENDING = "pending"
+    OPEN = "open"
+    FILLED = "filled"
+    PARTIALLY_FILLED = "partially_filled"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
 
 
 @dataclass
@@ -221,3 +232,27 @@ class OrderBook:
         if self.bids and self.asks:
             return (self.best_bid + self.best_ask) / 2
         return 0.5
+
+
+@dataclass
+class OpenOrder:
+    """A resting limit order."""
+    order_id: str
+    market_id: str
+    token_id: str
+    outcome: Outcome
+    side: Side
+    price: float
+    size: float
+    filled_size: float = 0.0
+    status: OrderStatus = OrderStatus.OPEN
+    strategy: StrategyType = StrategyType.MARKET_MAKING
+    placed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @property
+    def remaining_size(self) -> float:
+        return self.size - self.filled_size
+
+    @property
+    def is_active(self) -> bool:
+        return self.status in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
