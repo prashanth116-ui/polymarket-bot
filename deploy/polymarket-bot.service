@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=polybot
-Group=polybot
+User=root
+Group=root
 WorkingDirectory=/opt/polymarket-bot
 EnvironmentFile=/opt/polymarket-bot/.env
 ExecStart=/opt/polymarket-bot/venv/bin/python run_paper_trading.py
