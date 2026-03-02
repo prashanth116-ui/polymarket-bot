@@ -388,3 +388,119 @@ def test_arb_losses_excluded_from_circuit_breaker():
     rm.record_trade_close(50.0, -10.0, "crypto", strategy="arbitrage")
     rm.record_trade_close(50.0, -10.0, "crypto", strategy="arbitrage")
     assert rm._consecutive_losses == 0
+
+
+# --- Per-market cooldown and entry limit tests ---
+
+
+def test_cooldown_blocks_reentry():
+    """Exit a market, try re-entry within 60 min -> blocked."""
+    rm = RiskManager(
+        max_daily_loss=500.0, max_positions=10, max_exposure=5000.0,
+        max_exposure_per_category=2000.0, max_position_size=200.0,
+        cooldown_minutes=60.0, max_entries_per_market=5,
+    )
+    market = _make_market("iran-1", "Will Iran attack?", "politics")
+    signal = _make_signal("iran-1")
+
+    # Open and close a position
+    rm.record_trade_open(50.0, "politics", "iran-1")
+    rm.record_trade_close(50.0, -5.0, "politics", market_id="iran-1")
+
+    # Immediate re-entry should be blocked (within cooldown)
+    allowed, reason = rm.check_trade(signal, market)
+    assert allowed is False
+    assert "Cooldown" in reason
+
+
+def test_cooldown_allows_after_expiry():
+    """Exit, wait > cooldown -> allowed."""
+    from datetime import timedelta
+    rm = RiskManager(
+        max_daily_loss=500.0, max_positions=10, max_exposure=5000.0,
+        max_exposure_per_category=2000.0, max_position_size=200.0,
+        cooldown_minutes=60.0, max_entries_per_market=5,
+    )
+    market = _make_market("iran-1", "Will Iran attack?", "politics")
+    signal = _make_signal("iran-1")
+
+    # Open and close a position
+    rm.record_trade_open(50.0, "politics", "iran-1")
+    rm.record_trade_close(50.0, -5.0, "politics", market_id="iran-1")
+
+    # Manually backdate the exit time to simulate waiting
+    from datetime import datetime, timezone
+    rm._recently_exited["iran-1"] = datetime.now(timezone.utc) - timedelta(minutes=61)
+
+    allowed, reason = rm.check_trade(signal, market)
+    assert allowed is True
+
+
+def test_market_entry_limit():
+    """Enter same market 2x, 3rd blocked."""
+    rm = RiskManager(
+        max_daily_loss=500.0, max_positions=10, max_exposure=5000.0,
+        max_exposure_per_category=2000.0, max_position_size=200.0,
+        cooldown_minutes=0.0,  # No cooldown so we can test entry limit alone
+        max_entries_per_market=2,
+    )
+    market = _make_market("iran-1", "Will Iran attack?", "politics")
+    signal = _make_signal("iran-1")
+
+    # Two entries are allowed
+    rm.record_trade_open(50.0, "politics", "iran-1")
+    rm.record_trade_close(50.0, 5.0, "politics", market_id="iran-1")
+    rm.record_trade_open(50.0, "politics", "iran-1")
+    rm.record_trade_close(50.0, 5.0, "politics", market_id="iran-1")
+
+    # 3rd entry should be blocked
+    allowed, reason = rm.check_trade(signal, market)
+    assert allowed is False
+    assert "Market entry limit" in reason
+
+
+def test_market_entry_limit_resets_daily():
+    """Reset clears entry count, allowing new entries."""
+    rm = RiskManager(
+        max_daily_loss=500.0, max_positions=10, max_exposure=5000.0,
+        max_exposure_per_category=2000.0, max_position_size=200.0,
+        cooldown_minutes=0.0,
+        max_entries_per_market=2,
+    )
+    market = _make_market("iran-1", "Will Iran attack?", "politics")
+    signal = _make_signal("iran-1")
+
+    # Use up 2 entries
+    rm.record_trade_open(50.0, "politics", "iran-1")
+    rm.record_trade_close(50.0, 5.0, "politics", market_id="iran-1")
+    rm.record_trade_open(50.0, "politics", "iran-1")
+    rm.record_trade_close(50.0, 5.0, "politics", market_id="iran-1")
+
+    # Blocked
+    allowed, _ = rm.check_trade(signal, market)
+    assert allowed is False
+
+    # Daily reset clears entry count
+    rm.reset_daily()
+    allowed, reason = rm.check_trade(signal, market)
+    assert allowed is True
+
+
+def test_cooldown_different_market_allowed():
+    """Cooldown on market A doesn't block market B."""
+    rm = RiskManager(
+        max_daily_loss=500.0, max_positions=10, max_exposure=5000.0,
+        max_exposure_per_category=2000.0, max_position_size=200.0,
+        cooldown_minutes=60.0, max_entries_per_market=5,
+    )
+    market_a = _make_market("iran-1", "Will Iran attack?", "politics")
+    market_b = _make_market("btc-1", "Will BTC hit 100k?", "crypto")
+    signal_b = _make_signal("btc-1")
+
+    # Exit market A
+    rm.record_trade_open(50.0, "politics", "iran-1")
+    rm.record_trade_close(50.0, -5.0, "politics", market_id="iran-1")
+
+    # Market B should be unaffected
+    allowed, reason = rm.check_trade(signal_b, market_b)
+    assert allowed is True

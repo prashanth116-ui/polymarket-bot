@@ -33,6 +33,8 @@ class RiskManager:
         max_correlated_positions: int = 2,
         max_same_outcome_per_category: int = 2,
         portfolio: "Portfolio" = None,
+        cooldown_minutes: float = 60.0,
+        max_entries_per_market: int = 2,
     ):
         self.max_daily_loss = max_daily_loss
         self.max_positions = max_positions
@@ -45,6 +47,8 @@ class RiskManager:
         self.max_correlated_positions = max_correlated_positions
         self.max_same_outcome_per_category = max_same_outcome_per_category
         self._portfolio = portfolio
+        self.cooldown_minutes = cooldown_minutes
+        self.max_entries_per_market = max_entries_per_market
 
         # State
         self._daily_pnl: float = 0.0
@@ -56,6 +60,8 @@ class RiskManager:
         self._kill_switch: bool = False
         self._circuit_broken: bool = False
         self._last_reset: Optional[datetime] = None
+        self._recently_exited: dict[str, datetime] = {}  # market_id -> exit_time
+        self._market_entry_count: dict[str, int] = {}    # market_id -> entries today
 
     def check_trade(self, signal: Signal, market: Market) -> tuple[bool, str]:
         """Check if a trade is allowed. Returns (allowed, reason).
@@ -65,6 +71,18 @@ class RiskManager:
         # Kill switch
         if self._kill_switch:
             return False, "Kill switch active"
+
+        # Per-market cooldown after exit
+        mid = market.condition_id
+        if mid in self._recently_exited:
+            elapsed = (datetime.now(timezone.utc) - self._recently_exited[mid]).total_seconds() / 60
+            if elapsed < self.cooldown_minutes:
+                return False, f"Cooldown: {elapsed:.0f}m / {self.cooldown_minutes:.0f}m since last exit"
+
+        # Per-market daily entry limit
+        entries = self._market_entry_count.get(mid, 0)
+        if entries >= self.max_entries_per_market:
+            return False, f"Market entry limit ({entries}/{self.max_entries_per_market} today)"
 
         # Circuit breaker
         if self._circuit_broken:
@@ -140,15 +158,18 @@ class RiskManager:
         """Wire portfolio for correlated/directional checks."""
         self._portfolio = portfolio
 
-    def record_trade_open(self, size: float, category: str = "other"):
+    def record_trade_open(self, size: float, category: str = "other", market_id: str = ""):
         """Record a new position being opened."""
         self._open_positions += 1
         self._open_exposure += size
         self._category_exposure[category] = self._category_exposure.get(category, 0.0) + size
         self._daily_trades += 1
+        if market_id:
+            self._market_entry_count[market_id] = self._market_entry_count.get(market_id, 0) + 1
 
     def record_trade_close(
         self, size: float, pnl: float, category: str = "other", strategy: str = "edge",
+        market_id: str = "",
     ):
         """Record a position being closed."""
         self._open_positions = max(0, self._open_positions - 1)
@@ -165,6 +186,9 @@ class RiskManager:
                 self._consecutive_losses += 1
             else:
                 self._consecutive_losses = 0
+
+        if market_id:
+            self._recently_exited[market_id] = datetime.now(timezone.utc)
 
         logger.info(
             f"Risk: trade closed P/L=${pnl:.2f} | "
@@ -189,6 +213,8 @@ class RiskManager:
         self._daily_trades = 0
         self._consecutive_losses = 0
         self._circuit_broken = False
+        self._market_entry_count.clear()
+        # Keep _recently_exited — it's time-based, not daily
         self._last_reset = datetime.now(timezone.utc)
         logger.info("Risk manager: daily reset")
 

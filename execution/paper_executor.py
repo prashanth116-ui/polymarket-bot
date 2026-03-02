@@ -31,6 +31,7 @@ class PaperExecutor(ExecutorInterface):
         initial_balance: float = 1000.0,
         slippage_bps: int = 50,
         fee_bps: int = TAKER_FEE_BPS,
+        storage=None,
     ):
         self.balance = initial_balance
         self.initial_balance = initial_balance
@@ -43,6 +44,7 @@ class PaperExecutor(ExecutorInterface):
         self.daily_trades = 0
         self._next_order_id = 1
         self.open_orders: dict[str, OpenOrder] = {}  # order_id -> OpenOrder
+        self._storage = storage
 
     def _position_key(self, market_id: str, outcome: Outcome) -> str:
         return f"{market_id}:{outcome.value}"
@@ -118,6 +120,15 @@ class PaperExecutor(ExecutorInterface):
                 strategy=strategy,
             )
 
+        # Persist to DB
+        pos = self.positions[key]
+        if self._storage:
+            self._storage.save_position(
+                market_id=market_id, outcome=outcome.value, token_id=token_id,
+                entry_price=pos.entry_price, size=pos.size, cost_basis=pos.cost_basis,
+                strategy=strategy.value if hasattr(strategy, 'value') else str(strategy),
+            )
+
         result = TradeResult(
             market_id=market_id,
             outcome=outcome,
@@ -162,8 +173,17 @@ class PaperExecutor(ExecutorInterface):
             pos.size -= size
             if pos.size <= 0.01:  # Effectively closed
                 del self.positions[key]
+                if self._storage:
+                    self._storage.remove_position(market_id, outcome.value)
             else:
                 pos.realized_pnl += realized_pnl
+                if self._storage:
+                    self._storage.save_position(
+                        market_id=market_id, outcome=outcome.value,
+                        token_id=pos.token_id, entry_price=pos.entry_price,
+                        size=pos.size, cost_basis=pos.cost_basis,
+                        strategy=pos.strategy.value if hasattr(pos.strategy, 'value') else str(pos.strategy),
+                    )
 
         self.balance += net_revenue
         self.total_fees += fee
@@ -215,6 +235,8 @@ class PaperExecutor(ExecutorInterface):
         )
 
         del self.positions[key]
+        if self._storage:
+            self._storage.remove_position(market_id, outcome.value)
 
     def cancel(self, order_id: str) -> bool:
         logger.info(f"PAPER CANCEL order {order_id}")
@@ -348,6 +370,32 @@ class PaperExecutor(ExecutorInterface):
         if to_cancel:
             logger.info(f"Cancelled {len(to_cancel)} orders" + (f" for {market_id}" if market_id else ""))
         return len(to_cancel)
+
+    def restore_positions(self) -> list[Position]:
+        """Restore positions from database on startup."""
+        if not self._storage:
+            return []
+        db_positions = self._storage.get_positions()
+        restored = []
+        for row in db_positions:
+            outcome = Outcome(row["outcome"])
+            strategy = StrategyType(row["strategy"]) if row.get("strategy") else StrategyType.EDGE
+            pos = Position(
+                market_id=row["market_id"],
+                condition_id=row["market_id"],
+                outcome=outcome,
+                token_id=row.get("token_id", ""),
+                side=Side.BUY,
+                entry_price=row["entry_price"],
+                size=row["size"],
+                cost_basis=row["cost_basis"],
+                current_price=row["entry_price"],
+                strategy=strategy,
+            )
+            key = self._position_key(row["market_id"], outcome)
+            self.positions[key] = pos
+            restored.append(pos)
+        return restored
 
     def reset_daily(self):
         """Reset daily tracking counters."""

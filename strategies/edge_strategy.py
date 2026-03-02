@@ -53,6 +53,7 @@ class EdgeStrategy:
         max_position: float = DEFAULT_MAX_POSITION_SIZE,
         bankroll: float = 1000.0,
         exit_config: dict = None,
+        min_ev: float = 0.0,
     ):
         self.model = model
         self.min_edge = min_edge
@@ -61,6 +62,7 @@ class EdgeStrategy:
         self.kelly_mult = kelly_mult
         self.max_position = max_position
         self.bankroll = bankroll
+        self.min_ev = min_ev
 
         # Exit tuning (configurable via settings.yaml)
         ec = exit_config or {}
@@ -177,6 +179,14 @@ class EdgeStrategy:
         shares = size_usd / market_price
         ev = expected_value(model_prob, market_price, shares)
 
+        if ev < self.min_ev:
+            logger.info(
+                f"EV too low: {market.question[:40]}... {outcome.value} "
+                f"EV=${ev:.2f} < ${self.min_ev:.2f} "
+                f"(edge={edge:.1%}, size=${size_usd:.2f})"
+            )
+            return None
+
         logger.info(
             f"Edge found: {market.question[:40]}... {outcome.value} "
             f"model={model_prob:.1%} market={market_price:.1%} "
@@ -221,6 +231,9 @@ class EdgeStrategy:
         market_price = market.last_price_yes if position.outcome == Outcome.YES else market.last_price_no
         position.update_pnl(market_price)
 
+        # Compute hold time once for all exit checks
+        hold_minutes = (datetime.now(timezone.utc) - position.opened_at).total_seconds() / 60
+
         # Track peak unrealized P/L for trailing stop
         if position.unrealized_pnl > position.peak_unrealized_pnl:
             position.peak_unrealized_pnl = position.unrealized_pnl
@@ -244,9 +257,6 @@ class EdgeStrategy:
             if current_edge < self.min_edge * 0.4:  # Edge less than 40% of min threshold
                 position.edge_gone_consecutive += 1
 
-                # Check minimum hold time
-                hold_minutes = (datetime.now(timezone.utc) - position.opened_at).total_seconds() / 60
-
                 if (position.edge_gone_consecutive >= self.edge_gone_checks
                         and hold_minutes >= self.min_hold_minutes):
                     exit_reason = ExitReason.EDGE_GONE
@@ -266,14 +276,17 @@ class EdgeStrategy:
                 position.edge_gone_consecutive = 0  # Reset when edge recovers
 
         # 2. Edge decay — edge below threshold for N consecutive checks
+        #    Requires minimum hold time (same as edge_gone) to prevent premature exits
         if not exit_reason and current_edge is not None:
             if current_edge < self.edge_decay_threshold:
                 position.low_edge_consecutive += 1
-                if position.low_edge_consecutive >= self.edge_decay_checks:
+                if (position.low_edge_consecutive >= self.edge_decay_checks
+                        and hold_minutes >= self.min_hold_minutes):
                     exit_reason = ExitReason.EDGE_DECAY
                     exit_reasoning = (
                         f"Edge decay: edge={current_edge:.1%} below {self.edge_decay_threshold:.0%} "
-                        f"for {position.low_edge_consecutive} consecutive checks"
+                        f"for {position.low_edge_consecutive} consecutive checks "
+                        f"(held {hold_minutes:.0f}min)"
                     )
             else:
                 position.low_edge_consecutive = 0

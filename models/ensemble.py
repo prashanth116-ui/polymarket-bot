@@ -28,8 +28,9 @@ class EnsembleModel(ProbabilityModel):
     Models with lower Brier scores (better calibration) get higher weight.
     """
 
-    def __init__(self, models: list[ProbabilityModel] = None):
+    def __init__(self, models: list[ProbabilityModel] = None, max_disagreement: float = 1.0):
         self.models: list[ProbabilityModel] = models or []
+        self.max_disagreement = max_disagreement
         self._weights: dict[str, float] = {}  # model_name -> weight
         self._brier_scores: dict[str, list[float]] = {}  # model_name -> recent scores
 
@@ -99,6 +100,15 @@ class EnsembleModel(ProbabilityModel):
         # Ensemble confidence: mild penalty for disagreement (20% max reduction)
         avg_confidence = sum(p["confidence"] * p["weight"] for p in predictions) / total_weight
         disagreement = self._measure_disagreement(predictions)
+
+        # Hard gate: reject if models disagree too much
+        if disagreement > self.max_disagreement:
+            logger.info(
+                f"Ensemble rejected: disagreement={disagreement:.3f} > "
+                f"max={self.max_disagreement:.3f} for {market.question[:40]}..."
+            )
+            return None
+
         ensemble_confidence = avg_confidence * (1 - disagreement * 0.2)
 
         # Build reasoning summary

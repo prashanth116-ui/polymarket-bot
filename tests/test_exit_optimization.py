@@ -130,6 +130,8 @@ def test_edge_decay_triggers_after_3_checks():
     market = _make_market(price_yes=0.50)
 
     pos = _make_position(entry_price=0.50, size=20, cost_basis=10.0)
+    # Set opened_at far enough in the past to satisfy min_hold_minutes
+    pos.opened_at = datetime.now(timezone.utc) - timedelta(minutes=60)
 
     # First two checks: edge < 3% but not enough consecutive
     strategy.check_exit(market, pos)

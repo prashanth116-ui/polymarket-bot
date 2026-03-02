@@ -96,25 +96,40 @@ class LiveTrader:
         self.implied_model = MarketImpliedModel()
         self.base_rate_model = BaseRateModel()
         self.time_decay_model = TimeDecayModel()
-        self.ensemble = EnsembleModel([
-            self.implied_model,
-            self.base_rate_model,
-            self.time_decay_model,
-        ])
+        self.ensemble = EnsembleModel(
+            models=[
+                self.implied_model,
+                self.base_rate_model,
+                self.time_decay_model,
+            ],
+            max_disagreement=strat_cfg.get("max_model_disagreement", 1.0),
+        )
 
         # Try to add LLM model if API key available
         self._init_llm_model()
 
+        # Detect if LLM is available — escalate thresholds if not
+        self._has_llm = any("llm" in m.name.lower() for m in self.ensemble.models)
+        effective_min_edge = strat_cfg.get("min_edge", DEFAULT_MIN_EDGE)
+        if not self._has_llm:
+            stat_only_edge = strat_cfg.get("stat_only_min_edge", 0.12)
+            logger.info(
+                f"No LLM available — raising min_edge from "
+                f"{effective_min_edge:.0%} to {stat_only_edge:.0%}"
+            )
+            effective_min_edge = stat_only_edge
+
         # Strategies
         self.edge_strategy = EdgeStrategy(
             model=self.ensemble,
-            min_edge=strat_cfg.get("min_edge", DEFAULT_MIN_EDGE),
+            min_edge=effective_min_edge,
             min_confidence=strat_cfg.get("min_confidence", DEFAULT_MIN_CONFIDENCE),
             min_liquidity=strat_cfg.get("min_liquidity", DEFAULT_MIN_LIQUIDITY),
             kelly_mult=risk_cfg.get("kelly_fraction", DEFAULT_KELLY_FRACTION),
             max_position=risk_cfg.get("max_position_size", DEFAULT_MAX_POSITION_SIZE),
             bankroll=bankroll,
             exit_config=settings.get("exits", {}),
+            min_ev=strat_cfg.get("min_ev", 0.0),
         )
 
         self.arb_strategy = ArbitrageStrategy(
@@ -152,6 +167,8 @@ class LiveTrader:
             max_positions_per_category=risk_cfg.get("max_positions_per_category", 3),
             max_correlated_positions=risk_cfg.get("max_correlated_positions", 2),
             max_same_outcome_per_category=risk_cfg.get("max_same_outcome_per_category", 2),
+            cooldown_minutes=risk_cfg.get("cooldown_minutes", 60.0),
+            max_entries_per_market=risk_cfg.get("max_entries_per_market_per_day", 2),
         )
 
         self.portfolio = Portfolio()
@@ -164,7 +181,7 @@ class LiveTrader:
 
         # Execution
         if mode == "paper":
-            self.executor = PaperExecutor(initial_balance=bankroll)
+            self.executor = PaperExecutor(initial_balance=bankroll, storage=self.storage)
         else:
             from execution.bridge_executor import BridgeExecutor
             bridge_url = self.settings.get("bridge", {}).get("url", "http://127.0.0.1:8420")
@@ -240,9 +257,39 @@ class LiveTrader:
 
         logger.info("No LLM API key found — running with statistical models only")
 
+    def _restore_positions_from_db(self):
+        """Reload open positions from the paper executor's DB-persisted state."""
+        if not isinstance(self.executor, PaperExecutor):
+            return
+        positions = self.executor.restore_positions()
+        for pos in positions:
+            market = self.cache.get_market(pos.market_id)
+            if not market:
+                # Try scanner as fallback
+                try:
+                    market = self.scanner.get_market(pos.market_id)
+                except Exception:
+                    market = None
+            if market:
+                self.portfolio.add_position(pos, market)
+                self.risk_manager.record_trade_open(
+                    pos.cost_basis, market.category or "other", pos.market_id,
+                )
+                logger.info(f"Restored position: {market.question[:50]} {pos.outcome.value}")
+            else:
+                # Still add to portfolio without market metadata
+                self.portfolio.add_position(pos)
+                self.risk_manager.record_trade_open(pos.cost_basis, "other", pos.market_id)
+                logger.info(f"Restored position (no market data): {pos.market_id[:20]} {pos.outcome.value}")
+        if positions:
+            logger.info(f"Restored {len(positions)} positions from previous session")
+
     def run(self):
         """Main loop entry point."""
         self._running = True
+
+        # Restore positions from DB before anything else
+        self._restore_positions_from_db()
 
         # Register signal handlers
         signal.signal(signal.SIGINT, self._handle_shutdown)
@@ -481,7 +528,8 @@ class LiveTrader:
             return
 
         # Two-tier LLM: re-evaluate edge trades with expensive model before execution
-        if signal.strategy == StrategyType.EDGE:
+        # Skip when no LLM — final tier would just re-run the same stat models
+        if signal.strategy == StrategyType.EDGE and self._has_llm:
             context = self._build_context(market)
             final_signal = self.coordinator.edge.evaluate(market, context, tier="final")
             if final_signal is None:
@@ -530,7 +578,7 @@ class LiveTrader:
                     break
 
             # Track in risk manager
-            self.risk_manager.record_trade_open(sized, market.category or "other")
+            self.risk_manager.record_trade_open(sized, market.category or "other", market.condition_id)
 
             # Track in coordinator
             if signal.strategy == StrategyType.EDGE:
@@ -676,6 +724,7 @@ class LiveTrader:
                 pnl=pnl,
                 category=market.category or "other",
                 strategy=pos.strategy.value,
+                market_id=pos.market_id,
             )
 
             # Track in coordinator
@@ -735,7 +784,9 @@ class LiveTrader:
         pnl = pos.size if pos.outcome.value == market.resolution else -pos.cost_basis
 
         self.portfolio.remove_position(pos.market_id, pos.outcome)
-        self.risk_manager.record_trade_close(pos.cost_basis, pnl, market.category or "other")
+        self.risk_manager.record_trade_close(
+            pos.cost_basis, pnl, market.category or "other", market_id=pos.market_id,
+        )
 
         self.notifier.send_exit(
             market_question=market.question,

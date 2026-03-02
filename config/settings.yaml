@@ -28,12 +28,17 @@ risk:
   max_positions_per_category: 3   # Max open positions in one category
   max_correlated_positions: 2     # Max positions in correlated markets (same topic/keywords)
   max_same_outcome_per_category: 2  # Max same-outcome bets per category (prevents all-NO bias)
+  cooldown_minutes: 60              # Wait 60 min before re-entering exited market
+  max_entries_per_market_per_day: 2  # Max entries per market per day
 
 # Strategy defaults
 strategy:
-  min_edge: 0.05  # 5%
-  min_confidence: 0.6
-  min_liquidity: 500  # USDC
+  min_edge: 0.07  # 7% — ~3% net margin after 4% round-trip fees
+  min_confidence: 0.65
+  min_liquidity: 1000  # USDC — thin markets have noisier prices
+  min_ev: 2.0  # Minimum expected value ($) to take a trade
+  stat_only_min_edge: 0.12  # Min edge when no LLM available (stat models alone)
+  max_model_disagreement: 0.15  # Reject when model predictions diverge too much
 
 # Exit tuning
 exits:
@@ -41,10 +46,10 @@ exits:
   trailing_stop_retracement: 0.50  # Exit if unrealized drops below 50% of peak
   stop_loss_tight: 0.20  # Stop loss for small-edge trades (<8%)
   stop_loss_wide: 0.30   # Stop loss for large-edge trades (>=8%)
-  edge_gone_checks: 2    # Consecutive checks with edge < 40% threshold before edge_gone exit
-  min_hold_minutes: 10   # Minimum hold time (minutes) before edge_gone exit allowed
+  edge_gone_checks: 3    # Consecutive checks with edge < 40% threshold before edge_gone exit
+  min_hold_minutes: 30   # Minimum hold time (minutes) before edge_gone/decay exit allowed
   edge_decay_threshold: 0.03  # Edge must stay above 3%
-  edge_decay_checks: 3   # Consecutive checks below threshold before exit
+  edge_decay_checks: 4   # Consecutive checks below threshold before exit
   tp_near_hours: 24      # Hours to resolution: near
   tp_near_pct: 0.15      # Take profit if gain > 15% (near resolution)
   tp_mid_pct: 0.30       # Take profit if gain > 30% (24-72h)
