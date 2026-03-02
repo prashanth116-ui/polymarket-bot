@@ -102,7 +102,7 @@ class MarketScanner:
                 condition_id=condition_id,
                 question=raw.get("question", ""),
                 description=raw.get("description", ""),
-                category=raw.get("groupItemTitle", "") or _infer_category(raw),
+                category=_validate_category(raw.get("groupItemTitle", "")) or _infer_category(raw),
                 end_date=end_date,
                 tokens=tokens,
                 active=raw.get("active", False),
@@ -233,13 +233,28 @@ class MarketScanner:
         return near[:limit]
 
 
+_KNOWN_CATEGORIES = {"politics", "crypto", "sports", "economics", "science", "entertainment"}
+
+
+def _validate_category(group_title: str) -> str:
+    """Return the group title only if it's a known category slug, else empty string."""
+    if group_title and group_title.lower().strip() in _KNOWN_CATEGORIES:
+        return group_title.lower().strip()
+    return ""
+
+
 def _infer_category(raw: dict) -> str:
     """Infer category from question/description keywords."""
     text = (raw.get("question", "") + " " + raw.get("description", "")).lower()
     categories = {
-        "politics": ["president", "election", "congress", "senate", "trump", "biden", "democrat", "republican", "vote"],
+        "politics": [
+            "president", "election", "congress", "senate", "trump", "biden",
+            "democrat", "republican", "vote", "regime", "ceasefire", "strike",
+            "iran", "israel", "war", "sanctions", "military", "nato", "nuclear",
+            "invasion", "conflict", "khamenei", "leader", "minister",
+        ],
         "crypto": ["bitcoin", "ethereum", "btc", "eth", "crypto", "token", "blockchain", "solana"],
-        "sports": ["nba", "nfl", "mlb", "nhl", "soccer", "football", "basketball", "championship", "super bowl"],
+        "sports": ["nba", "nfl", "mlb", "nhl", "soccer", "football", "basketball", "championship", "super bowl", "fifa", "world cup", "la liga"],
         "economics": ["gdp", "inflation", "fed", "interest rate", "unemployment", "recession", "cpi"],
         "science": ["nasa", "spacex", "climate", "ai ", "artificial intelligence", "fda"],
         "entertainment": ["oscar", "grammy", "movie", "show", "netflix", "celebrity"],
