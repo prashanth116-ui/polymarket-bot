@@ -108,6 +108,19 @@ telegram:
   enabled: true
   heartbeat_interval: 3600  # 1 hour
 
+# Crypto scalper (5M/15M up/down markets)
+crypto_scalper:
+  enabled: false  # Start disabled, enable explicitly via CLI
+  asset: btc
+  interval_minutes: 15
+  bankroll: 200  # Separate bankroll from edge strategy
+  position_size: 20  # USDC per trade
+  min_momentum: 0.0003  # 3bps BTC move in 30s
+  min_price_gap: 0.05  # 5% gap between implied and market
+  max_entry_price: 0.92  # Don't buy above $0.92
+  entry_window_secs: 60  # Trade in last 60s of window
+  max_trades_per_hour: 4  # Safety: max 4 trades/hour (one per window)
+
 # Logging
 logging:
   level: INFO

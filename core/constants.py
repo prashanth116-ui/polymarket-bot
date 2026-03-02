@@ -59,3 +59,15 @@ MM_MAX_MM_EXPOSURE = 500.0  # USDC total MM exposure
 ARB_MIN_PROFIT_BPS = 50  # Min profit in basis points (0.5%)
 ARB_MAX_POSITION = 100  # Max USDC per arb
 ARB_MAX_ARB_EXPOSURE = 200.0  # USDC total arb exposure
+
+# Binance WebSocket
+BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
+
+# Crypto scalper defaults
+CRYPTO_DEFAULT_POSITION_SIZE = 20.0  # USDC per trade
+CRYPTO_DEFAULT_INTERVAL_MINS = 15
+CRYPTO_DEFAULT_MIN_MOMENTUM = 0.0003  # 3bps
+CRYPTO_DEFAULT_ENTRY_WINDOW_SECS = 60
+CRYPTO_DEFAULT_MAX_ENTRY_PRICE = 0.92
+CRYPTO_DEFAULT_MIN_PRICE_GAP = 0.05  # 5% gap between implied and market
+CRYPTO_DEFAULT_BANKROLL = 200.0  # Separate bankroll from edge strategy

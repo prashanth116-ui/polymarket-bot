@@ -41,6 +41,7 @@ class StrategyType(Enum):
     EDGE = "edge"
     MARKET_MAKING = "market_making"
     ARBITRAGE = "arbitrage"
+    CRYPTO_SCALPER = "crypto_scalper"
 
 
 class ExitReason(Enum):
@@ -55,6 +56,7 @@ class ExitReason(Enum):
     RISK_LIMIT = "risk_limit"
     ARBITRAGE = "arbitrage"
     MM_INVENTORY = "mm_inventory"
+    WINDOW_EXPIRED = "window_expired"
 
 
 class OrderStatus(Enum):
