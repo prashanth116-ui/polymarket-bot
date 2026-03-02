@@ -1,0 +1,24 @@
+[Unit]
+Description=Polymarket Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polybot
+Group=polybot
+WorkingDirectory=/opt/polymarket-bot
+EnvironmentFile=/opt/polymarket-bot/.env
+ExecStart=/opt/polymarket-bot/venv/bin/python run_paper_trading.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/opt/polymarket-bot/logs/service.log
+StandardError=append:/opt/polymarket-bot/logs/service.log
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/polymarket-bot
+
+[Install]
+WantedBy=multi-user.target

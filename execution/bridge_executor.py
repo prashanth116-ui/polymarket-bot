@@ -1,6 +1,7 @@
 """Executor that communicates with the TypeScript bridge via HTTP."""
 
 import logging
+import time
 from typing import Optional
 
 import requests
@@ -25,23 +26,75 @@ logger = logging.getLogger(__name__)
 class BridgeExecutor(ExecutorInterface):
     """Sends orders to the TypeScript bridge at localhost:8420."""
 
-    def __init__(self, bridge_url: str = DEFAULT_BRIDGE_URL, timeout: int = 10):
+    def __init__(
+        self,
+        bridge_url: str = DEFAULT_BRIDGE_URL,
+        timeout: int = 10,
+        max_retries: int = 2,
+        retry_delay: float = 1.0,
+    ):
         self.bridge_url = bridge_url.rstrip("/")
         self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self._health_ok: bool = False
+        self._last_health_check: float = 0
+        self._health_check_interval: float = 60.0
 
     def _request(self, method: str, path: str, **kwargs) -> dict:
         url = f"{self.bridge_url}{path}"
         kwargs.setdefault("timeout", self.timeout)
+        last_exc = None
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = getattr(requests, method)(url, **kwargs)
+                resp.raise_for_status()
+                return resp.json()
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                last_exc = e
+                if attempt < self.max_retries:
+                    delay = self.retry_delay * (2 ** attempt)
+                    logger.warning(
+                        f"Bridge request {method.upper()} {path} failed (attempt {attempt + 1}/"
+                        f"{self.max_retries + 1}): {e} — retrying in {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Bridge not reachable at {url} after {self.max_retries + 1} attempts")
+            except requests.exceptions.HTTPError as e:
+                status = resp.status_code
+                if 500 <= status < 600 and attempt < self.max_retries:
+                    last_exc = e
+                    delay = self.retry_delay * (2 ** attempt)
+                    logger.warning(
+                        f"Bridge {status} on {method.upper()} {path} (attempt {attempt + 1}/"
+                        f"{self.max_retries + 1}) — retrying in {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+                else:
+                    # 4xx errors: don't retry — client error
+                    logger.error(f"Bridge error {status}: {resp.text}")
+                    raise
+
+        raise last_exc
+
+    @property
+    def health_ok(self) -> bool:
+        """Cached health status, refreshed every 60s."""
+        now = time.time()
+        if now - self._last_health_check >= self._health_check_interval:
+            self._refresh_health()
+        return self._health_ok
+
+    def _refresh_health(self):
+        """Check bridge health and cache result."""
         try:
-            resp = getattr(requests, method)(url, **kwargs)
-            resp.raise_for_status()
-            return resp.json()
-        except requests.exceptions.ConnectionError:
-            logger.error(f"Bridge not reachable at {url}")
-            raise
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"Bridge error {resp.status_code}: {resp.text}")
-            raise
+            self.health()
+            self._health_ok = True
+        except Exception:
+            self._health_ok = False
+        self._last_health_check = time.time()
 
     def health(self) -> dict:
         return self._request("get", "/health")

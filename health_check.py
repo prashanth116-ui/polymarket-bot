@@ -21,6 +21,7 @@ def check_imports():
         from data.market_scanner import MarketScanner
         from data.clob_client import ClobReader
         from data.websocket_client import PolymarketWebSocket
+        from data.ws_price_feed import WebSocketPriceFeed
         from data.market_cache import MarketCache
         from data.storage import Storage
         from data.sources.news_feed import NewsFeed
@@ -34,6 +35,7 @@ def check_imports():
         from strategies.arbitrage import ArbitrageStrategy
         from strategies.market_maker import MarketMakerStrategy
         from strategies.coordinator import StrategyCoordinator
+        from execution.reconciler import PositionReconciler
         from risk.risk_manager import RiskManager
         from risk.position_sizer import PositionSizer
         from risk.portfolio import Portfolio
@@ -161,6 +163,37 @@ def check_news_feed():
         return False
 
 
+def check_ws_price_feed():
+    """Verify WebSocket price feed module loads."""
+    print("Checking WebSocket price feed...")
+    try:
+        from data.ws_price_feed import WebSocketPriceFeed
+        feed = WebSocketPriceFeed()
+        assert feed.connected is False
+        assert feed.subscription_count == 0
+        print("  WebSocketPriceFeed: OK")
+        return True
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        return False
+
+
+def check_reconciler():
+    """Verify reconciler module loads."""
+    print("Checking position reconciler...")
+    try:
+        from execution.reconciler import PositionReconciler, ReconciliationResult
+        recon = PositionReconciler()
+        result = recon.reconcile([], [])
+        assert not result.has_mismatches
+        assert result.mismatch_count == 0
+        print("  PositionReconciler: OK")
+        return True
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        return False
+
+
 def check_paper_executor():
     """Verify paper executor works."""
     print("Checking paper executor...")
@@ -214,6 +247,8 @@ def main():
         "Config": check_config(),
         "Environment": check_env(),
         "Paper Executor": check_paper_executor(),
+        "WS Price Feed": check_ws_price_feed(),
+        "Reconciler": check_reconciler(),
         "CLOB API": check_clob_api(),
         "News Feed": check_news_feed(),
         "Bridge": check_bridge(),

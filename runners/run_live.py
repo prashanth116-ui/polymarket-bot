@@ -45,7 +45,9 @@ from data.clob_client import ClobReader
 from data.market_cache import MarketCache
 from data.market_scanner import MarketScanner
 from data.storage import Storage
+from data.ws_price_feed import WebSocketPriceFeed
 from execution.paper_executor import PaperExecutor
+from execution.reconciler import PositionReconciler
 from models.calibration import CalibrationTracker
 from models.ensemble import EnsembleModel
 from models.statistical import BaseRateModel, MarketImpliedModel, TimeDecayModel
@@ -175,8 +177,28 @@ class LiveTrader:
         self._last_heartbeat: float = 0
         self._last_daily_reset: Optional[str] = None
 
+        # WebSocket price feed
+        ws_cfg = self.settings.get("websocket", {})
+        self._ws_enabled = ws_cfg.get("enabled", True)
+        self._ws_fallback_to_rest = ws_cfg.get("fallback_to_rest", True)
+        self.ws_feed: Optional[WebSocketPriceFeed] = None
+        if self._ws_enabled:
+            self.ws_feed = WebSocketPriceFeed()
+
+        # Position reconciliation (live mode only)
+        recon_cfg = self.settings.get("reconciliation", {})
+        self.reconciler = PositionReconciler(
+            reconcile_interval=recon_cfg.get("interval", 300),
+        )
+
+        # Bridge health tracking (live mode only)
+        self._bridge_degraded = False
+
         # Watched markets (candidates for trading)
         self._watched_markets: list[str] = []
+
+        # Track subscribed token IDs for WS
+        self._ws_subscribed_tokens: set[str] = set()
 
     def _init_llm_model(self):
         """Add LLM model to ensemble if API key is available."""
@@ -229,12 +251,25 @@ class LiveTrader:
             f"Balance: ${self.executor.get_balance():.2f}"
         )
 
+        # Start WebSocket price feed
+        if self.ws_feed:
+            self.ws_feed.start()
+            logger.info("WebSocket price feed started")
+
         try:
             while self._running:
                 loop_start = time.time()
 
                 # Daily reset at 00:00 UTC
                 self._check_daily_reset()
+
+                # Bridge health check (live mode only)
+                if self.mode == "live":
+                    self._check_bridge_health()
+
+                # Position reconciliation (live mode only)
+                if self.mode == "live" and self.reconciler.should_reconcile():
+                    self._run_reconciliation()
 
                 # Full market scan (every 30 min)
                 if time.time() - self._last_full_scan >= self.full_scan_interval:
@@ -289,6 +324,20 @@ class LiveTrader:
                     last_price_no=m.last_price_no,
                 )
 
+            # Subscribe new tokens to WebSocket
+            if self.ws_feed:
+                new_tokens = set()
+                for m in markets:
+                    if m.yes_token_id:
+                        new_tokens.add(m.yes_token_id)
+                    if m.no_token_id:
+                        new_tokens.add(m.no_token_id)
+                to_subscribe = new_tokens - self._ws_subscribed_tokens
+                if to_subscribe:
+                    self.ws_feed.subscribe(list(to_subscribe))
+                    self._ws_subscribed_tokens.update(to_subscribe)
+                    logger.info(f"WS subscribed to {len(to_subscribe)} new tokens")
+
             self._last_full_scan = time.time()
             logger.info(f"Scan complete: {len(markets)} markets watched")
 
@@ -334,19 +383,32 @@ class LiveTrader:
         if not self.risk_manager.is_trading_allowed:
             return
 
+        # Drain WebSocket price updates first
+        ws_prices: dict[str, float] = {}
+        if self.ws_feed:
+            ws_prices = self.ws_feed.drain_updates()
+            if ws_prices:
+                for token_id, price in ws_prices.items():
+                    self.cache.update_price(token_id, price)
+
         for cid in self._watched_markets:
             market = self.cache.get_market(cid)
             if not market:
                 continue
 
-            # Update price from CLOB
-            try:
-                if market.yes_token_id:
-                    mid = self.clob.get_midpoint(market.yes_token_id)
-                    if mid is not None:
-                        self.cache.update_price(market.yes_token_id, mid)
-            except Exception:
-                pass
+            # Fall back to REST if WS didn't provide an update for this market
+            ws_had_update = (
+                market.yes_token_id in ws_prices or
+                market.no_token_id in ws_prices
+            )
+            if not ws_had_update or not self._ws_enabled:
+                try:
+                    if market.yes_token_id:
+                        mid = self.clob.get_midpoint(market.yes_token_id)
+                        if mid is not None:
+                            self.cache.update_price(market.yes_token_id, mid)
+                except Exception:
+                    pass
 
             # Check limit order fills in paper mode
             if isinstance(self.executor, PaperExecutor) and market.yes_token_id:
@@ -620,6 +682,82 @@ class LiveTrader:
 
         logger.info(f"RESOLVED: {market.question[:40]}... -> {market.resolution} (P/L=${pnl:.2f})")
 
+    def _check_bridge_health(self):
+        """Check bridge health and enter/exit degraded mode (live mode only)."""
+        from execution.bridge_executor import BridgeExecutor
+        if not isinstance(self.executor, BridgeExecutor):
+            return
+
+        was_degraded = self._bridge_degraded
+
+        if self.executor.health_ok:
+            if was_degraded:
+                # Bridge recovered
+                self._bridge_degraded = False
+                self.coordinator.degraded_mode = False
+                logger.info("Bridge recovered — resuming full mode")
+                self.notifier.send("Bridge recovered — full mode restored")
+        else:
+            if not was_degraded:
+                # Bridge went down — enter degraded mode
+                self._bridge_degraded = True
+                self.coordinator.degraded_mode = True
+
+                # Cancel all MM quotes (can't manage them without bridge)
+                cancelled = self.executor.cancel_all_orders()
+                logger.warning(
+                    f"Bridge offline — degraded mode (cancelled {cancelled} orders)"
+                )
+                self.notifier.send_error(
+                    "Bridge offline — degraded mode. MM/arb blocked, edge exits only."
+                )
+
+    def _run_reconciliation(self):
+        """Run position reconciliation against bridge (live mode only)."""
+        from execution.bridge_executor import BridgeExecutor
+        if not isinstance(self.executor, BridgeExecutor):
+            return
+
+        try:
+            bridge_positions = self.executor.get_positions()
+            local_positions = self.portfolio.positions
+
+            result = self.reconciler.reconcile(local_positions, bridge_positions)
+
+            if result.has_mismatches:
+                # Bridge is source of truth for size mismatches
+                for mm in result.size_mismatches:
+                    pos = self.portfolio.get_position(mm.market_id, mm.outcome)
+                    if pos:
+                        pos.size = mm.bridge_size
+                        logger.info(
+                            f"Reconciled {mm.market_id}:{mm.outcome.value} "
+                            f"size {mm.local_size:.2f} -> {mm.bridge_size:.2f}"
+                        )
+
+                # Bridge-only positions: add to portfolio
+                for mm in result.bridge_only:
+                    for bp in bridge_positions:
+                        if bp.market_id == mm.market_id and bp.outcome == mm.outcome:
+                            self.portfolio.add_position(bp)
+                            logger.info(
+                                f"Added bridge-only position {mm.market_id}:{mm.outcome.value}"
+                            )
+
+                # Local-only: mark stale (log warning, don't auto-remove)
+                for mm in result.local_only:
+                    logger.warning(
+                        f"Stale local position {mm.market_id}:{mm.outcome.value} "
+                        f"(size={mm.local_size:.2f}, not on bridge)"
+                    )
+
+                self.notifier.send(
+                    f"Position reconciliation: {result.summary()}"
+                )
+
+        except Exception as e:
+            logger.error(f"Reconciliation error: {e}")
+
     def _check_daily_reset(self):
         """Reset daily counters at 00:00 UTC."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -661,7 +799,7 @@ class LiveTrader:
         port_summary = self.portfolio.summary()
         coord_summary = self.coordinator.summary()
 
-        return {
+        summary = {
             "balance": exe_summary.get("balance", 0),
             "daily_pnl": exe_summary.get("daily_pnl", risk_summary.get("daily_pnl", 0)),
             "daily_trades": exe_summary.get("daily_trades", risk_summary.get("daily_trades", 0)),
@@ -680,7 +818,11 @@ class LiveTrader:
             "mm_exposure": coord_summary.get("mm_exposure", 0),
             "arb_exposure": coord_summary.get("arb_exposure", 0),
             "open_orders": coord_summary.get("open_orders", 0),
+            "ws_connected": self.ws_feed.connected if self.ws_feed else False,
+            "ws_subscriptions": self.ws_feed.subscription_count if self.ws_feed else 0,
+            "bridge_degraded": self._bridge_degraded,
         }
+        return summary
 
     def _interruptible_sleep(self, seconds: float):
         """Sleep that can be interrupted by shutdown signal."""
@@ -695,6 +837,10 @@ class LiveTrader:
     def _shutdown(self):
         """Clean shutdown — close positions summary, save state."""
         logger.info("Shutting down...")
+
+        # Stop WebSocket feed
+        if self.ws_feed:
+            self.ws_feed.stop()
 
         # Final summary
         self._send_daily_summary()

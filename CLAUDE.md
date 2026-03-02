@@ -53,8 +53,44 @@ python -m runners.market_monitor --book TOKEN_ID
 
 ### Paper Trading
 ```bash
+# 24/7 wrapper with auto-restart
 python run_paper_trading.py
+
+# Direct live loop (paper mode)
+python -m runners.run_live --paper --bankroll 1000
+
+# Direct live loop (live mode — real money!)
+python -m runners.run_live --live --bankroll 500
+
+# Override min edge
+python -m runners.run_live --paper --min-edge 0.08
 ```
+
+## Risk Management
+
+### Risk Manager Checks (all must pass)
+1. Kill switch not active
+2. Circuit breaker not tripped
+3. Daily loss < $50 (configurable)
+4. Consecutive losses < 3
+5. Open positions < 10
+6. Total exposure < max
+7. Per-category exposure < $200
+8. Position size < $100
+9. Time to resolution > 24h
+
+### Position Sizing
+- Quarter Kelly (25% Kelly fraction)
+- Max position: $100
+- Max bankroll per trade: 10%
+- Min trade size: $1
+- Scaled down near exposure limits
+
+### Portfolio Tracking
+- Exposure by category (politics, crypto, sports, etc.)
+- Exposure by strategy (edge, MM, arb)
+- Correlated market detection (same category or keyword overlap)
+- Remaining exposure caps
 
 ## Key Files
 
@@ -83,6 +119,10 @@ python run_paper_trading.py
 | `models/calibration.py` | Brier score tracking + calibration curves |
 | `strategies/base.py` | Abstract Strategy base class |
 | `strategies/edge_strategy.py` | Edge strategy (buy when model > market + min_edge) |
+| `risk/risk_manager.py` | Circuit breaker, daily loss, consecutive loss, kill switch |
+| `risk/position_sizer.py` | Kelly-based sizing with caps |
+| `risk/portfolio.py` | Portfolio exposure tracking + correlated market detection |
+| `runners/run_live.py` | Main 24/7 trading loop (paper or live) |
 | `runners/notifier.py` | Telegram alerts |
 | `runners/market_monitor.py` | CLI market watcher tool |
 | `bridge/src/index.ts` | Express server (port 8420) |

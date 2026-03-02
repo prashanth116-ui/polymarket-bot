@@ -66,6 +66,20 @@ class StrategyCoordinator:
         # Open order tracking
         self._open_orders: dict[str, OpenOrder] = {}  # order_id -> OpenOrder
 
+        # Degraded mode — bridge down, only allow edge exits
+        self._degraded: bool = False
+
+    @property
+    def degraded_mode(self) -> bool:
+        """Whether the coordinator is in degraded mode (bridge down)."""
+        return self._degraded
+
+    @degraded_mode.setter
+    def degraded_mode(self, value: bool):
+        if value != self._degraded:
+            self._degraded = value
+            logger.warning(f"Coordinator degraded_mode={'ON' if value else 'OFF'}")
+
     def evaluate_market(
         self,
         market: Market,
@@ -75,10 +89,17 @@ class StrategyCoordinator:
 
         Returns all valid signals for this market (may include multiple
         from different strategies if no conflicts).
+
+        In degraded mode: blocks all new entries (MM, arb, edge).
+        Edge exits are handled separately in _manage_positions.
         """
         context = context or {}
         cid = market.condition_id
         signals: list[Signal] = []
+
+        # Degraded mode: no new entries at all
+        if self._degraded:
+            return signals
 
         # Priority 1: Edge
         if cid not in self._edge_markets:
@@ -217,4 +238,5 @@ class StrategyCoordinator:
             "max_mm_markets": self.max_mm_markets,
             "max_mm_exposure": self.max_mm_exposure,
             "max_arb_exposure": self.max_arb_exposure,
+            "degraded_mode": self._degraded,
         }

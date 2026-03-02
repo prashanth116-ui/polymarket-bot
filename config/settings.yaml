@@ -65,6 +65,19 @@ coordinator:
   max_mm_exposure: 300   # USDC
   max_arb_exposure: 200  # USDC
 
+# WebSocket price streaming
+websocket:
+  enabled: true
+  fallback_to_rest: true
+
+# Position reconciliation (live mode only)
+reconciliation:
+  interval: 300  # seconds (5 min)
+
+# Deployment
+deploy:
+  droplet_ip: ""  # Set to your droplet IP
+
 # Telegram alerts
 telegram:
   enabled: false
