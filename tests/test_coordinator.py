@@ -27,7 +27,7 @@ class StubModel(ProbabilityModel):
     def name(self):
         return "stub"
 
-    def predict(self, market, outcome, context=None):
+    def predict(self, market, outcome, context=None, **kwargs):
         return ProbabilityEstimate(
             market_id=market.condition_id,
             outcome=outcome,

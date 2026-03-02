@@ -57,6 +57,7 @@ class EnsembleModel(ProbabilityModel):
         market: Market,
         outcome: Outcome,
         context: dict = None,
+        **kwargs,
     ) -> Optional[ProbabilityEstimate]:
         """Aggregate predictions from all models using weighted average."""
         predictions = []
@@ -67,7 +68,7 @@ class EnsembleModel(ProbabilityModel):
                 continue
 
             try:
-                estimate = model.predict(market, outcome, context)
+                estimate = model.predict(market, outcome, context, **kwargs)
                 if estimate is None:
                     continue
 

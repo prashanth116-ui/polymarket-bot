@@ -21,7 +21,7 @@ class StubModel(ProbabilityModel):
     def name(self) -> str:
         return "stub"
 
-    def predict(self, market, outcome, context=None):
+    def predict(self, market, outcome, context=None, **kwargs):
         return ProbabilityEstimate(
             market_id=market.condition_id,
             outcome=outcome,
@@ -169,14 +169,15 @@ def test_evaluates_both_outcomes():
     """Strategy should check both YES and NO for edge."""
     # Model thinks 30% YES (= 70% NO), market says 50% YES (50% NO)
     # Edge on NO: 0.70 - 0.50 = 0.20
-    model = StubModel(prob=0.30)  # 30% for whatever outcome is asked
+    model = StubModel(prob=0.30)
     strategy = EdgeStrategy(model, min_edge=0.05, bankroll=1000)
     market = _make_market(price_yes=0.50)
 
-    # The model returns 0.30 for both outcomes, so neither has meaningful edge
-    # against a 0.50 market price (0.30 < 0.50)
+    # YES=0.30, NO=0.70. NO has 20% edge against 0.50 market price.
     signal = strategy.evaluate(market)
-    assert signal is None
+    assert signal is not None
+    assert signal.outcome == Outcome.NO
+    assert signal.edge > 0.15  # ~20% edge
 
 
 def test_exit_stop_loss():

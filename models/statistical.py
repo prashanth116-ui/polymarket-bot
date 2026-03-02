@@ -29,6 +29,7 @@ class MarketImpliedModel(ProbabilityModel):
         market: Market,
         outcome: Outcome,
         context: dict = None,
+        **kwargs,
     ) -> Optional[ProbabilityEstimate]:
         price = market.last_price_yes if outcome == Outcome.YES else market.last_price_no
 
@@ -124,6 +125,7 @@ class BaseRateModel(ProbabilityModel):
         market: Market,
         outcome: Outcome,
         context: dict = None,
+        **kwargs,
     ) -> Optional[ProbabilityEstimate]:
         category = market.category.lower() if market.category else "other"
         question_lower = market.question.lower()
@@ -207,6 +209,7 @@ class TimeDecayModel(ProbabilityModel):
         market: Market,
         outcome: Outcome,
         context: dict = None,
+        **kwargs,
     ) -> Optional[ProbabilityEstimate]:
         hours = market.hours_to_resolution
         if hours is None:

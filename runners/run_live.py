@@ -144,7 +144,8 @@ class LiveTrader:
         self.risk_manager = RiskManager(
             max_daily_loss=risk_cfg.get("max_daily_loss", 50.0),
             max_positions=risk_cfg.get("max_positions", 10),
-            max_exposure=bankroll * risk_cfg.get("max_exposure_pct", 0.25),
+            max_exposure=bankroll * risk_cfg.get("max_exposure_pct", 0.50),
+            max_exposure_per_category=bankroll * risk_cfg.get("max_category_exposure_pct", 0.40),
             max_consecutive_losses=risk_cfg.get("max_consecutive_losses", 3),
             max_position_size=risk_cfg.get("max_position_size", DEFAULT_MAX_POSITION_SIZE),
         )
@@ -474,6 +475,23 @@ class LiveTrader:
             logger.info(f"Trade blocked by risk: {reason}")
             return
 
+        # Two-tier LLM: re-evaluate edge trades with expensive model before execution
+        if signal.strategy == StrategyType.EDGE:
+            context = self._build_context(market)
+            final_signal = self.coordinator.edge.evaluate(market, context, tier="final")
+            if final_signal is None:
+                logger.info(
+                    f"Final-tier LLM rejected trade: {market.question[:50]}... "
+                    f"(screening edge={signal.edge:.1%})"
+                )
+                return
+            # Use the final-tier signal (updated edge, prob, size)
+            signal = final_signal
+            logger.info(
+                f"Final-tier LLM confirmed: {signal.outcome.value} "
+                f"edge={signal.edge:.1%} (model={signal.metadata.get('model_prob', 0):.1%})"
+            )
+
         # Get token ID
         token_id = market.yes_token_id if signal.outcome == Outcome.YES else market.no_token_id
 
@@ -623,20 +641,25 @@ class LiveTrader:
     def _execute_exit(self, signal: Signal, pos: Position, market: Market):
         """Execute a position exit."""
         try:
+            # Capture before sell() modifies/deletes the position
+            exit_size = pos.size
+            entry_price = pos.entry_price
+            cost_basis = pos.cost_basis
+
             result = self.executor.sell(
                 market_id=pos.market_id,
                 token_id=pos.token_id,
                 outcome=pos.outcome,
                 price=signal.price,
-                size=pos.size,
+                size=exit_size,
             )
 
-            pnl = (result.price - pos.entry_price) * pos.size
+            pnl = (result.price - entry_price) * exit_size
 
             # Update tracking
             self.portfolio.remove_position(pos.market_id, pos.outcome)
             self.risk_manager.record_trade_close(
-                size=pos.cost_basis,
+                size=cost_basis,
                 pnl=pnl,
                 category=market.category or "other",
             )
@@ -645,9 +668,9 @@ class LiveTrader:
             if pos.strategy == StrategyType.EDGE:
                 self.coordinator.record_edge_exit(pos.market_id)
             elif pos.strategy == StrategyType.ARBITRAGE:
-                self.coordinator.record_arb_exit(pos.market_id, pos.cost_basis)
+                self.coordinator.record_arb_exit(pos.market_id, cost_basis)
             elif pos.strategy == StrategyType.MARKET_MAKING:
-                self.coordinator.record_mm_exit(pos.market_id, pos.cost_basis)
+                self.coordinator.record_mm_exit(pos.market_id, cost_basis)
 
             # Record in storage
             exit_reason = signal.metadata.get("exit_reason", "unknown")

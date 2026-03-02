@@ -25,6 +25,7 @@ class ProbabilityModel(ABC):
         market: Market,
         outcome: Outcome,
         context: dict = None,
+        **kwargs,
     ) -> Optional[ProbabilityEstimate]:
         """Estimate the probability of a market outcome.
 
@@ -32,6 +33,7 @@ class ProbabilityModel(ABC):
             market: The prediction market to evaluate
             outcome: Which outcome to estimate (YES or NO)
             context: Additional data (news articles, polls, economic indicators, etc.)
+            **kwargs: Extra params (e.g., tier='screening'|'final' for LLM models)
 
         Returns:
             ProbabilityEstimate or None if the model can't make a prediction

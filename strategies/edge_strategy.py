@@ -24,6 +24,7 @@ from core.types import (
     Market,
     Outcome,
     Position,
+    ProbabilityEstimate,
     Signal,
     SignalAction,
     StrategyType,
@@ -70,8 +71,11 @@ class EdgeStrategy:
         self,
         market: Market,
         context: dict = None,
+        tier: str = "screening",
     ) -> Optional[Signal]:
         """Evaluate both YES and NO outcomes, return signal for the best edge.
+
+        Estimates YES probability once, derives NO = 1 - YES for consistency.
 
         Returns:
             Signal if edge found, None otherwise
@@ -80,48 +84,62 @@ class EdgeStrategy:
         if not self._passes_filters(market):
             return None
 
+        # Get YES estimate once — derive NO from it
+        yes_estimate = self.model.predict(market, Outcome.YES, context, tier=tier)
+        if yes_estimate is None:
+            return None
+
+        if yes_estimate.confidence < self.min_confidence:
+            return None
+
+        yes_prob = yes_estimate.probability
+        no_prob = 1.0 - yes_prob
+
         best_signal = None
         best_edge = 0.0
 
-        for outcome in [Outcome.YES, Outcome.NO]:
-            signal = self._evaluate_outcome(market, outcome, context)
-            if signal and signal.edge > best_edge:
-                best_signal = signal
-                best_edge = signal.edge
+        # Check YES side
+        signal = self._evaluate_with_prob(
+            market, Outcome.YES, yes_prob, yes_estimate, context,
+        )
+        if signal and signal.edge > best_edge:
+            best_signal = signal
+            best_edge = signal.edge
+
+        # Check NO side (derived probability)
+        signal = self._evaluate_with_prob(
+            market, Outcome.NO, no_prob, yes_estimate, context,
+        )
+        if signal and signal.edge > best_edge:
+            best_signal = signal
+            best_edge = signal.edge
 
         return best_signal
 
-    def _evaluate_outcome(
+    def _evaluate_with_prob(
         self,
         market: Market,
         outcome: Outcome,
+        model_prob: float,
+        estimate: ProbabilityEstimate,
         context: dict = None,
     ) -> Optional[Signal]:
-        """Evaluate a single outcome for edge."""
+        """Evaluate a single outcome using a pre-computed probability."""
         market_price = market.last_price_yes if outcome == Outcome.YES else market.last_price_no
 
         # Skip extreme prices
         if market_price < MIN_PRICE_FOR_BUY or market_price > MAX_PRICE_FOR_BUY:
             return None
 
-        # Get model estimate
-        estimate = self.model.predict(market, outcome, context)
-        if estimate is None:
-            return None
-
-        # Check confidence
-        if estimate.confidence < self.min_confidence:
-            return None
-
         # Calculate edge
-        edge = estimate.probability - market_price
+        edge = model_prob - market_price
         if edge < self.min_edge:
             return None
 
         # Calculate position size via Kelly
         size_usd = size_position(
             bankroll=self.bankroll,
-            true_prob=estimate.probability,
+            true_prob=model_prob,
             market_price=market_price,
             kelly_mult=self.kelly_mult,
             max_position=self.max_position,
@@ -132,11 +150,11 @@ class EdgeStrategy:
 
         # Calculate expected value
         shares = size_usd / market_price
-        ev = expected_value(estimate.probability, market_price, shares)
+        ev = expected_value(model_prob, market_price, shares)
 
         logger.info(
             f"Edge found: {market.question[:40]}... {outcome.value} "
-            f"model={estimate.probability:.1%} market={market_price:.1%} "
+            f"model={model_prob:.1%} market={market_price:.1%} "
             f"edge={edge:.1%} size=${size_usd:.2f} EV=${ev:.2f}"
         )
 
@@ -151,9 +169,9 @@ class EdgeStrategy:
             confidence=estimate.confidence,
             reasoning=estimate.reasoning,
             metadata={
-                "model_prob": estimate.probability,
+                "model_prob": model_prob,
                 "market_price": market_price,
-                "kelly_fraction": kelly_fraction(estimate.probability, market_price),
+                "kelly_fraction": kelly_fraction(model_prob, market_price),
                 "expected_value": ev,
                 "model_name": estimate.model_name,
             },

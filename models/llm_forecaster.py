@@ -319,6 +319,7 @@ class LLMForecaster(ProbabilityModel):
         outcome: Outcome,
         context: dict = None,
         tier: str = "screening",
+        **kwargs,
     ) -> Optional[ProbabilityEstimate]:
         """Estimate probability using LLM.
 
