@@ -100,7 +100,9 @@ class RiskManager:
         self._category_exposure[category] = self._category_exposure.get(category, 0.0) + size
         self._daily_trades += 1
 
-    def record_trade_close(self, size: float, pnl: float, category: str = "other"):
+    def record_trade_close(
+        self, size: float, pnl: float, category: str = "other", strategy: str = "edge",
+    ):
         """Record a position being closed."""
         self._open_positions = max(0, self._open_positions - 1)
         self._open_exposure = max(0, self._open_exposure - size)
@@ -110,10 +112,12 @@ class RiskManager:
 
         self._daily_pnl += pnl
 
-        if pnl < 0:
-            self._consecutive_losses += 1
-        else:
-            self._consecutive_losses = 0
+        # Only count edge/MM losses for circuit breaker (arb is risk-free at resolution)
+        if strategy != "arbitrage":
+            if pnl < 0:
+                self._consecutive_losses += 1
+            else:
+                self._consecutive_losses = 0
 
         logger.info(
             f"Risk: trade closed P/L=${pnl:.2f} | "

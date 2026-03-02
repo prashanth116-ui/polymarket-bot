@@ -172,6 +172,7 @@ class Position:
     take_profit: Optional[float] = None
     peak_unrealized_pnl: float = 0.0
     low_edge_consecutive: int = 0
+    entry_edge: float = 0.0  # Edge at entry time (model_prob - market_price)
 
     @property
     def market_value(self) -> float:

@@ -32,6 +32,19 @@ strategy:
   min_confidence: 0.6
   min_liquidity: 500  # USDC
 
+# Exit tuning
+exits:
+  trailing_stop_trigger: 0.20   # Activate trailing stop after 20% gain
+  trailing_stop_retracement: 0.50  # Exit if unrealized drops below 50% of peak
+  stop_loss_tight: 0.20  # Stop loss for small-edge trades (<8%)
+  stop_loss_wide: 0.30   # Stop loss for large-edge trades (>=8%)
+  edge_decay_threshold: 0.03  # Edge must stay above 3%
+  edge_decay_checks: 3   # Consecutive checks below threshold before exit
+  tp_near_hours: 24      # Hours to resolution: near
+  tp_near_pct: 0.15      # Take profit if gain > 15% (near resolution)
+  tp_mid_pct: 0.30       # Take profit if gain > 30% (24-72h)
+  tp_far_pct: 0.50       # Take profit if gain > 50% (>72h)
+
 # Market filters
 filters:
   min_volume_24h: 100  # USDC

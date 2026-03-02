@@ -131,8 +131,8 @@ def test_ensemble_disagreement():
 
     est = ensemble.predict(market, Outcome.YES)
     assert est is not None
-    # High disagreement should lower confidence
-    assert est.confidence < 0.5
+    # High disagreement should lower confidence (mild 20% penalty)
+    assert est.confidence < 0.8  # Lower than raw 0.8 avg confidence
 
 
 def test_ensemble_agreement():

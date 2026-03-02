@@ -155,8 +155,9 @@ def test_edge_decay_resets_on_good_edge():
     strategy.check_exit(market, pos)
     assert pos.low_edge_consecutive == 1
 
-    # Now edge recovers
+    # Now edge recovers — clear exit cache so new prob is used
     model._prob = 0.58  # 8% edge — above 3%
+    strategy._exit_cache.clear()
     strategy.check_exit(market, pos)
     assert pos.low_edge_consecutive == 0
 

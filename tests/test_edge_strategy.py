@@ -57,7 +57,7 @@ def test_edge_found():
     signal = strategy.evaluate(market)
     assert signal is not None
     assert signal.outcome == Outcome.YES
-    assert signal.edge >= 0.19
+    assert signal.edge >= 0.18  # ~19% edge after 2% fee adjustment
     assert signal.size > 0
 
 

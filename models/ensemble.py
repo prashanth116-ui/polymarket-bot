@@ -96,10 +96,10 @@ class EnsembleModel(ProbabilityModel):
         weighted_prob = sum(p["probability"] * p["weight"] for p in predictions) / total_weight
         weighted_prob = max(0.01, min(0.99, weighted_prob))
 
-        # Ensemble confidence: based on agreement between models
+        # Ensemble confidence: mild penalty for disagreement (20% max reduction)
         avg_confidence = sum(p["confidence"] * p["weight"] for p in predictions) / total_weight
         disagreement = self._measure_disagreement(predictions)
-        ensemble_confidence = avg_confidence * (1 - disagreement)
+        ensemble_confidence = avg_confidence * (1 - disagreement * 0.2)
 
         # Build reasoning summary
         model_summaries = []
@@ -149,7 +149,7 @@ class EnsembleModel(ProbabilityModel):
         """Update a model's weight based on its Brier score.
 
         Lower Brier = better calibration = higher weight.
-        Weight = 1 / (avg_brier + epsilon)
+        Uses exponential smoothing to prevent volatile weight swings.
         """
         if model_name not in self._brier_scores:
             self._brier_scores[model_name] = []
@@ -160,18 +160,19 @@ class EnsembleModel(ProbabilityModel):
         if len(self._brier_scores[model_name]) > 50:
             self._brier_scores[model_name] = self._brier_scores[model_name][-50:]
 
-        # Calculate new weight
+        # Calculate new weight with capped inverse
         avg_brier = sum(self._brier_scores[model_name]) / len(self._brier_scores[model_name])
-        # Weight inversely proportional to Brier score
-        # Perfect Brier = 0 -> weight = 1/0.01 = 100
-        # Random Brier = 0.25 -> weight = 1/0.26 = 3.85
-        # Bad Brier = 0.5 -> weight = 1/0.51 = 1.96
-        new_weight = max(MIN_WEIGHT, 1.0 / (avg_brier + 0.01))
+        # Capped: Perfect=0 -> 10, Random=0.25 -> 3.6, Bad=0.5 -> 1.9
+        raw_weight = max(MIN_WEIGHT, 1.0 / (avg_brier + 0.1))
 
-        self._weights[model_name] = new_weight
+        # Exponential smoothing (alpha=0.3) — prevents wild swings
+        old_weight = self._weights.get(model_name, DEFAULT_WEIGHT)
+        smoothed = 0.3 * raw_weight + 0.7 * old_weight
+
+        self._weights[model_name] = smoothed
 
         logger.debug(
-            f"Weight update: {model_name} avg_brier={avg_brier:.4f} -> weight={new_weight:.2f}"
+            f"Weight update: {model_name} avg_brier={avg_brier:.4f} -> weight={smoothed:.2f}"
         )
 
     def get_weights(self) -> dict[str, float]:

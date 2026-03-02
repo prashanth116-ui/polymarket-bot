@@ -5,6 +5,7 @@ by at least min_edge. Position sized with quarter-Kelly.
 """
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -17,6 +18,7 @@ from core.constants import (
     MAX_PRICE_FOR_BUY,
     MIN_HOURS_TO_RESOLUTION,
     MIN_PRICE_FOR_BUY,
+    TAKER_FEE_BPS,
 )
 from core.kelly import expected_value, kelly_fraction, size_position
 from core.types import (
@@ -50,6 +52,7 @@ class EdgeStrategy:
         kelly_mult: float = DEFAULT_KELLY_FRACTION,
         max_position: float = DEFAULT_MAX_POSITION_SIZE,
         bankroll: float = 1000.0,
+        exit_config: dict = None,
     ):
         self.model = model
         self.min_edge = min_edge
@@ -58,6 +61,22 @@ class EdgeStrategy:
         self.kelly_mult = kelly_mult
         self.max_position = max_position
         self.bankroll = bankroll
+
+        # Exit tuning (configurable via settings.yaml)
+        ec = exit_config or {}
+        self.trailing_trigger = ec.get("trailing_stop_trigger", 0.20)
+        self.trailing_retracement = ec.get("trailing_stop_retracement", 0.50)
+        self.stop_tight = ec.get("stop_loss_tight", 0.20)
+        self.stop_wide = ec.get("stop_loss_wide", 0.30)
+        self.edge_decay_threshold = ec.get("edge_decay_threshold", 0.03)
+        self.edge_decay_checks = ec.get("edge_decay_checks", 3)
+        self.tp_near_pct = ec.get("tp_near_pct", 0.15)
+        self.tp_mid_pct = ec.get("tp_mid_pct", 0.30)
+        self.tp_far_pct = ec.get("tp_far_pct", 0.50)
+
+        # Exit prediction cache (avoid re-calling LLM every minute for same market)
+        self._exit_cache: dict[str, tuple[float, ProbabilityEstimate]] = {}
+        self._exit_cache_ttl = 120  # seconds — cache exit predictions for 2 min
 
     @property
     def strategy_type(self) -> StrategyType:
@@ -131,8 +150,10 @@ class EdgeStrategy:
         if market_price < MIN_PRICE_FOR_BUY or market_price > MAX_PRICE_FOR_BUY:
             return None
 
-        # Calculate edge
-        edge = model_prob - market_price
+        # Calculate edge (fee-adjusted to match Kelly sizing)
+        fee_rate = TAKER_FEE_BPS / 10000
+        effective_price = market_price * (1 + fee_rate)
+        edge = model_prob - effective_price
         if edge < self.min_edge:
             return None
 
@@ -203,9 +224,16 @@ class EdgeStrategy:
         exit_reason = None
         exit_reasoning = ""
 
-        # 1. Edge gone — re-run model
+        # 1. Edge gone — re-run model (with 2-min cache to reduce API calls)
         current_edge = None
-        estimate = self.model.predict(market, position.outcome, context)
+        cache_key = f"{market.condition_id}:{position.outcome.value}"
+        cached = self._exit_cache.get(cache_key)
+        if cached and time.time() - cached[0] < self._exit_cache_ttl:
+            estimate = cached[1]
+        else:
+            estimate = self.model.predict(market, position.outcome, context)
+            if estimate:
+                self._exit_cache[cache_key] = (time.time(), estimate)
         if estimate:
             current_edge = estimate.probability - market_price
             if current_edge < self.min_edge * 0.4:  # Edge less than 40% of min threshold
@@ -215,37 +243,36 @@ class EdgeStrategy:
                     f"market={market_price:.1%} edge={current_edge:.1%}"
                 )
 
-        # 2. Edge decay — edge < 3% for 3 consecutive checks
+        # 2. Edge decay — edge below threshold for N consecutive checks
         if not exit_reason and current_edge is not None:
-            if current_edge < 0.03:
+            if current_edge < self.edge_decay_threshold:
                 position.low_edge_consecutive += 1
-                if position.low_edge_consecutive >= 3:
+                if position.low_edge_consecutive >= self.edge_decay_checks:
                     exit_reason = ExitReason.EDGE_DECAY
                     exit_reasoning = (
-                        f"Edge decay: edge={current_edge:.1%} below 3% "
+                        f"Edge decay: edge={current_edge:.1%} below {self.edge_decay_threshold:.0%} "
                         f"for {position.low_edge_consecutive} consecutive checks"
                     )
             else:
                 position.low_edge_consecutive = 0
 
         # 3. Trailing stop — after 20%+ gain, trail at 50% of peak
-        if not exit_reason and position.cost_basis > 0:
+        if not exit_reason and position.cost_basis > 0.01:
             gain_pct = position.unrealized_pnl / position.cost_basis
             peak_pct = position.peak_unrealized_pnl / position.cost_basis
-            if peak_pct > 0.20 and position.unrealized_pnl < position.peak_unrealized_pnl * 0.50:
+            if peak_pct > self.trailing_trigger and position.unrealized_pnl < position.peak_unrealized_pnl * self.trailing_retracement:
                 exit_reason = ExitReason.TRAILING_STOP
                 exit_reasoning = (
                     f"Trailing stop: peak=${position.peak_unrealized_pnl:.2f} "
                     f"({peak_pct:.1%}), current=${position.unrealized_pnl:.2f} "
-                    f"({gain_pct:.1%}), below 50% of peak"
+                    f"({gain_pct:.1%}), below {self.trailing_retracement:.0%} of peak"
                 )
 
         # 4. Dynamic stop loss — tighter for small-edge trades
-        if not exit_reason and position.cost_basis > 0:
+        if not exit_reason and position.cost_basis > 0.01:
             loss_pct = -position.unrealized_pnl / position.cost_basis
-            # Small-edge trades (<8% entry edge) get tighter 20% stop
-            entry_edge = position.entry_price  # approximate; exact edge not stored
-            stop_threshold = 0.20 if (current_edge is not None and current_edge < 0.08) else 0.30
+            # Small-edge trades (<8% entry edge) get tighter stop
+            stop_threshold = self.stop_tight if position.entry_edge < 0.08 else self.stop_wide
             if loss_pct > stop_threshold:
                 exit_reason = ExitReason.STOP_LOSS
                 exit_reasoning = (
@@ -254,16 +281,16 @@ class EdgeStrategy:
                 )
 
         # 5. Time-based take profit — tightens approaching resolution
-        if not exit_reason and position.cost_basis > 0:
+        if not exit_reason and position.cost_basis > 0.01:
             gain_pct = position.unrealized_pnl / position.cost_basis
             hours = market.hours_to_resolution
             # Tighten TP as resolution approaches
             if hours is not None and hours < 24:
-                tp_threshold = 0.15
+                tp_threshold = self.tp_near_pct
             elif hours is not None and hours < 72:
-                tp_threshold = 0.30
+                tp_threshold = self.tp_mid_pct
             else:
-                tp_threshold = 0.50
+                tp_threshold = self.tp_far_pct
             if gain_pct > tp_threshold:
                 exit_reason = ExitReason.TAKE_PROFIT
                 exit_reasoning = (
@@ -272,12 +299,16 @@ class EdgeStrategy:
                     f"{f', {hours:.0f}h to resolution' if hours else ''})"
                 )
 
-        # 6. Near resolution with uncertainty
-        if not exit_reason:
+        # 6. Near resolution with uncertainty — only if not meaningfully profitable
+        if not exit_reason and position.cost_basis > 0.01:
             hours = market.hours_to_resolution
-            if hours is not None and hours < 6 and 0.25 < market_price < 0.75:
+            gain_pct_nr = position.unrealized_pnl / position.cost_basis
+            if hours is not None and hours < 6 and 0.25 < market_price < 0.75 and gain_pct_nr < 0.10:
                 exit_reason = ExitReason.NEAR_RESOLUTION
-                exit_reasoning = f"Near resolution ({hours:.1f}h) with uncertain price ({market_price:.1%})"
+                exit_reasoning = (
+                    f"Near resolution ({hours:.1f}h) with uncertain price ({market_price:.1%})"
+                    f" and low gain ({gain_pct_nr:.1%})"
+                )
 
         if not exit_reason:
             return None

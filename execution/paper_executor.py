@@ -47,12 +47,21 @@ class PaperExecutor(ExecutorInterface):
     def _position_key(self, market_id: str, outcome: Outcome) -> str:
         return f"{market_id}:{outcome.value}"
 
-    def _apply_slippage(self, price: float, side: Side) -> float:
-        """Apply simulated slippage."""
-        slip = price * (self.slippage_bps / 10000)
+    def _apply_slippage(self, price: float, side: Side, size: float = 0.0) -> float:
+        """Apply simulated slippage scaled by order size.
+
+        Larger orders get worse slippage: base bps + 10bps per $100 of order.
+        """
+        if self.slippage_bps == 0:
+            return price
+        base_slip = price * (self.slippage_bps / 10000)
+        # Size impact: +10bps per $100 order value
+        order_value = size * price if size > 0 else 0
+        size_slip = price * (order_value / 100) * 0.001  # 10bps per $100
+        total_slip = base_slip + size_slip
         if side == Side.BUY:
-            return min(0.99, price + slip)
-        return max(0.01, price - slip)
+            return min(0.99, price + total_slip)
+        return max(0.01, price - total_slip)
 
     def _generate_order_id(self) -> str:
         oid = f"paper-{self._next_order_id}"
@@ -68,7 +77,7 @@ class PaperExecutor(ExecutorInterface):
         size: float,
         strategy: StrategyType = StrategyType.EDGE,
     ) -> TradeResult:
-        fill_price = self._apply_slippage(price, Side.BUY)
+        fill_price = self._apply_slippage(price, Side.BUY, size)
         cost = size * fill_price
         fee = cost * (self.fee_bps / 10000)
         total_cost = cost + fee
@@ -139,7 +148,7 @@ class PaperExecutor(ExecutorInterface):
         size: float,
         exit_reason: Optional[ExitReason] = None,
     ) -> TradeResult:
-        fill_price = self._apply_slippage(price, Side.SELL)
+        fill_price = self._apply_slippage(price, Side.SELL, size)
         revenue = size * fill_price
         fee = revenue * (self.fee_bps / 10000)
         net_revenue = revenue - fee

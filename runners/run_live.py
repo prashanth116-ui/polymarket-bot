@@ -114,6 +114,7 @@ class LiveTrader:
             kelly_mult=risk_cfg.get("kelly_fraction", DEFAULT_KELLY_FRACTION),
             max_position=risk_cfg.get("max_position_size", DEFAULT_MAX_POSITION_SIZE),
             bankroll=bankroll,
+            exit_config=settings.get("exits", {}),
         )
 
         self.arb_strategy = ArbitrageStrategy(
@@ -520,6 +521,7 @@ class LiveTrader:
             positions = self.executor.get_positions()
             for pos in positions:
                 if pos.market_id == market.condition_id and pos.outcome == signal.outcome:
+                    pos.entry_edge = signal.edge
                     self.portfolio.add_position(pos, market)
                     break
 
@@ -576,6 +578,12 @@ class LiveTrader:
 
     def _execute_mm_signal(self, signal: Signal, market: Market):
         """Execute a market making signal by placing a limit order."""
+        # Risk check — enforce category exposure limits for MM too
+        allowed, reason = self.risk_manager.check_trade(signal, market)
+        if not allowed:
+            logger.debug(f"MM order blocked by risk: {reason}")
+            return
+
         token_id = market.yes_token_id if signal.outcome == Outcome.YES else market.no_token_id
         side = Side.BUY if signal.action == SignalAction.BUY else Side.SELL
 
@@ -625,16 +633,17 @@ class LiveTrader:
                     if mid is not None:
                         pos.update_pnl(mid)
                         self.cache.update_price(pos.token_id, mid)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Price update failed for {pos.market_id[:20]}: {e}")
 
             # Check for market resolution
             if market.resolution:
                 self._handle_resolution(pos, market)
                 continue
 
-            # Check exit conditions
-            exit_signal = self.edge_strategy.check_exit(market, pos)
+            # Check exit conditions (pass context so LLM sees news)
+            context = self._build_context(market)
+            exit_signal = self.edge_strategy.check_exit(market, pos, context)
             if exit_signal:
                 self._execute_exit(exit_signal, pos, market)
 
@@ -662,6 +671,7 @@ class LiveTrader:
                 size=cost_basis,
                 pnl=pnl,
                 category=market.category or "other",
+                strategy=pos.strategy.value,
             )
 
             # Track in coordinator
