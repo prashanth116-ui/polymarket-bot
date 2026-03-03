@@ -17,6 +17,8 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
+import requests
+
 from config.loader import load_settings
 from core.constants import (
     CRYPTO_DEFAULT_BANKROLL,
@@ -26,10 +28,10 @@ from core.constants import (
     CRYPTO_DEFAULT_MIN_MOMENTUM,
     CRYPTO_DEFAULT_MIN_PRICE_GAP,
     CRYPTO_DEFAULT_POSITION_SIZE,
+    GAMMA_API_URL,
 )
 from core.types import ExitReason, Outcome, StrategyType
 from data.clob_client import ClobReader
-from data.market_scanner import MarketScanner
 from data.spot_feed import BinanceSpotFeed
 from data.storage import Storage
 from execution.paper_executor import PaperExecutor
@@ -94,7 +96,6 @@ class CryptoTrader:
         # Components
         self.spot_feed = BinanceSpotFeed(f"{asset}usdt")
         self.clob = ClobReader()
-        self.scanner = MarketScanner()
         self.storage = Storage()
         self.executor = PaperExecutor(
             initial_balance=bankroll,
@@ -316,9 +317,11 @@ class CryptoTrader:
     def _discover_market(self) -> Optional[dict]:
         """Find the Polymarket market for the current 15-min window.
 
-        Uses slug-based lookup via Gamma API.
+        Uses the Gamma events endpoint with the exact slug (e.g. btc-updown-15m-1772506800).
         Returns dict with condition_id, up_token_id, down_token_id or None.
         """
+        import json as _json
+
         # Cache check — same window?
         window_ts = int(time.time() // self.interval_secs) * self.interval_secs
         if self._current_window_market and self._current_window_ts == window_ts:
@@ -327,46 +330,66 @@ class CryptoTrader:
         slug = current_window_slug(self.asset, self.interval_secs)
         logger.info(f"Discovering market for slug: {slug}")
 
-        # Search by slug via Gamma API
-        markets = self.scanner.search(slug, limit=5)
-        if not markets:
-            # Try alternate slug formats
-            alt_slug = f"{self.asset}-updown-{self.interval_secs // 60}min-{window_ts}"
-            markets = self.scanner.search(alt_slug, limit=5)
-
-        if not markets:
-            # Broad search fallback
-            query = f"{self.asset.upper()} up or down {self.interval_secs // 60} minute"
-            markets = self.scanner.search(query, limit=10)
-            # Filter for active markets ending soon
-            now = datetime.now(timezone.utc)
-            markets = [
-                m for m in markets
-                if m.active and m.end_date
-                and 0 < (m.end_date - now).total_seconds() < self.interval_secs + 60
-            ]
-
-        if not markets:
-            logger.warning(f"No market found for slug={slug}")
+        # Fetch from Gamma events endpoint (not markets search)
+        try:
+            resp = requests.get(
+                f"{GAMMA_API_URL}/events",
+                params={"slug": slug},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            events = resp.json()
+        except Exception as e:
+            logger.error(f"Gamma API error fetching event {slug}: {e}")
             return None
 
-        market = markets[0]
-        tokens = market.tokens
+        if not events:
+            logger.warning(f"No event found for slug={slug}")
+            return None
+
+        event = events[0]
+        event_markets = event.get("markets", [])
+        if not event_markets:
+            logger.warning(f"Event {slug} has no markets")
+            return None
+
+        raw_market = event_markets[0]
+
+        # Parse outcomes and token IDs
+        outcomes_raw = raw_market.get("outcomes", "[]")
+        if isinstance(outcomes_raw, str):
+            outcomes = _json.loads(outcomes_raw)
+        else:
+            outcomes = outcomes_raw or []
+
+        clob_ids_raw = raw_market.get("clobTokenIds", "[]")
+        if isinstance(clob_ids_raw, str):
+            clob_ids = _json.loads(clob_ids_raw)
+        else:
+            clob_ids = clob_ids_raw or []
 
         # Map Up/Down outcomes to token IDs
-        up_token_id = tokens.get("Up", tokens.get("YES", ""))
-        down_token_id = tokens.get("Down", tokens.get("NO", ""))
+        up_token_id = ""
+        down_token_id = ""
+        for i, outcome in enumerate(outcomes):
+            if i < len(clob_ids):
+                if outcome.lower() == "up":
+                    up_token_id = clob_ids[i]
+                elif outcome.lower() == "down":
+                    down_token_id = clob_ids[i]
 
         if not up_token_id or not down_token_id:
-            logger.warning(f"Could not map Up/Down tokens: {tokens}")
+            logger.warning(f"Could not map Up/Down tokens: outcomes={outcomes}, ids={clob_ids}")
             return None
 
+        condition_id = raw_market.get("conditionId", "")
+        question = raw_market.get("question", event.get("title", ""))
+
         result = {
-            "condition_id": market.condition_id,
-            "question": market.question,
+            "condition_id": condition_id,
+            "question": question,
             "up_token_id": up_token_id,
             "down_token_id": down_token_id,
-            "end_date": market.end_date,
         }
 
         # Cache for this window
@@ -374,80 +397,115 @@ class CryptoTrader:
         self._current_window_ts = window_ts
 
         logger.info(
-            f"Market found: {market.question} | "
-            f"Up={up_token_id[:12]}... Down={down_token_id[:12]}..."
+            f"Market found: {question} | "
+            f"Up={up_token_id[:16]}... Down={down_token_id[:16]}..."
         )
         return result
 
     def _check_resolution(self, market: dict):
-        """Check how the window resolved and record P/L."""
+        """Check how the window resolved and record P/L.
+
+        Uses token prices as primary signal (go to ~1.0/~0.0 on resolution),
+        falls back to Gamma API for confirmation.
+        """
         condition_id = market["condition_id"]
+        up_token = market["up_token_id"]
+        down_token = market["down_token_id"]
 
         # Poll for resolution (market resolves 5-30s after window close)
         resolved = False
-        for attempt in range(12):  # Up to 60 seconds of polling
+        resolution = None
+
+        for attempt in range(24):  # Up to 120 seconds of polling
             time.sleep(5)
 
-            # Check if market has resolved
-            m = self.scanner.get_market(condition_id)
-            if m and m.resolution:
-                resolved = True
-                resolution = m.resolution
-                logger.info(f"Window resolved: {resolution}")
+            # Primary: check token prices — they snap to ~1.0/~0.0 on resolution
+            up_price = self.clob.get_midpoint(up_token)
+            down_price = self.clob.get_midpoint(down_token)
 
-                # Resolve position in executor
-                positions = self.executor.get_positions()
-                for pos in positions:
-                    if pos.market_id == condition_id:
-                        self.executor.resolve_position(
-                            market_id=condition_id,
-                            outcome=pos.outcome,
-                            resolution=resolution,
-                        )
+            if up_price is not None and up_price > 0.90:
+                resolution = "Up"
+                logger.info(f"Up token at ${up_price:.4f} — resolved UP")
+            elif down_price is not None and down_price > 0.90:
+                resolution = "Down"
+                logger.info(f"Down token at ${down_price:.4f} — resolved DOWN")
 
-                        won = pos.outcome.value == resolution
-                        pnl = pos.size - pos.cost_basis if won else -pos.cost_basis
-                        if won:
-                            self._total_wins += 1
-                        else:
-                            self._total_losses += 1
+            # Fallback: check Gamma API for explicit resolution
+            if resolution is None:
+                try:
+                    resp = requests.get(
+                        f"{GAMMA_API_URL}/markets",
+                        params={"conditionId": condition_id},
+                        timeout=10,
+                    )
+                    if resp.status_code == 200:
+                        markets_data = resp.json()
+                        if markets_data and isinstance(markets_data, list):
+                            res = markets_data[0].get("resolution")
+                            if res:
+                                resolution = res
+                                logger.info(f"Gamma API resolution: {resolution}")
+                except Exception as e:
+                    logger.debug(f"Gamma resolution check error: {e}")
 
-                        self.notifier.send(
-                            f"{'<b>WIN</b>' if won else '<b>LOSS</b>'}\n"
-                            f"Market: {market['question']}\n"
-                            f"Resolution: {resolution}\n"
-                            f"P/L: ${pnl:+.2f}\n"
-                            f"Balance: ${self.executor.balance:.2f}\n"
-                            f"Record: {self._total_wins}W-{self._total_losses}L"
-                        )
+            if resolution is None:
+                if attempt < 23:
+                    logger.debug(f"Resolution poll {attempt+1}/24 — waiting...")
+                continue
 
-                        self.storage.record_trade(
-                            market_id=condition_id,
-                            outcome=pos.outcome.value,
-                            side="SELL",
-                            price=1.0 if won else 0.0,
-                            size=pos.size,
-                            cost=pos.size if won else 0.0,
-                            fee=0,
-                            strategy="crypto_scalper",
-                            exit_reason="window_expired",
-                        )
-                break
+            # Map resolution to the outcome we hold
+            # Our position outcome is YES (bought Up) or NO (bought Down)
+            resolved = True
+            positions = self.executor.get_positions()
+            for pos in positions:
+                if pos.market_id == condition_id:
+                    # Determine if we won
+                    if pos.outcome == Outcome.YES:
+                        won = resolution == "Up"
+                    else:
+                        won = resolution == "Down"
 
-            # Check token prices as proxy for resolution
-            up_price = self.clob.get_midpoint(market["up_token_id"])
-            down_price = self.clob.get_midpoint(market["down_token_id"])
-            if up_price and up_price > 0.95:
-                logger.info(f"Up token at ${up_price:.4f} — likely resolved UP")
-            elif down_price and down_price > 0.95:
-                logger.info(f"Down token at ${down_price:.4f} — likely resolved DOWN")
+                    pnl = pos.size - pos.cost_basis if won else -pos.cost_basis
+                    if won:
+                        self._total_wins += 1
+                    else:
+                        self._total_losses += 1
+
+                    # Resolve in executor (payout $1/share if won, $0 if lost)
+                    res_outcome = "YES" if resolution == "Up" else "NO"
+                    self.executor.resolve_position(
+                        market_id=condition_id,
+                        outcome=pos.outcome,
+                        resolution=res_outcome,
+                    )
+
+                    self.notifier.send(
+                        f"{'<b>WIN</b>' if won else '<b>LOSS</b>'}\n"
+                        f"Market: {market['question']}\n"
+                        f"Resolution: {resolution}\n"
+                        f"P/L: ${pnl:+.2f}\n"
+                        f"Balance: ${self.executor.balance:.2f}\n"
+                        f"Record: {self._total_wins}W-{self._total_losses}L"
+                    )
+
+                    self.storage.record_trade(
+                        market_id=condition_id,
+                        outcome=pos.outcome.value,
+                        side="SELL",
+                        price=1.0 if won else 0.0,
+                        size=pos.size,
+                        cost=pos.size if won else 0.0,
+                        fee=0,
+                        strategy="crypto_scalper",
+                        exit_reason="window_expired",
+                    )
+            break
 
         if not resolved:
             logger.warning(
-                f"Window did not resolve within 60s — "
+                f"Window did not resolve within 120s — "
                 f"selling position at market price"
             )
-            # Force exit at current price
             positions = self.executor.get_positions()
             for pos in positions:
                 if pos.market_id == condition_id:
@@ -544,14 +602,10 @@ def main():
     min_momentum = args.min_momentum or crypto_cfg.get("min_momentum", CRYPTO_DEFAULT_MIN_MOMENTUM)
     entry_window = args.entry_window or crypto_cfg.get("entry_window_secs", CRYPTO_DEFAULT_ENTRY_WINDOW_SECS)
 
-    # Setup logging
+    # Setup logging — use StreamHandler only (systemd captures stdout to log file)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler("logs/crypto_scalper.log"),
-        ],
     )
 
     trader = CryptoTrader(
