@@ -213,10 +213,16 @@ class CryptoTrader:
         """Core loop: sleep until entry zone -> evaluate -> trade -> wait for resolution."""
         while self._running:
             try:
+                # Compute absolute deadline for this window (avoids wrapping bug
+                # where window_seconds_remaining() jumps to ~900 after close)
+                now = time.time()
+                window_ts = int(now // self.interval_secs) * self.interval_secs
+                deadline = window_ts + self.interval_secs
+
                 # 1. Sleep until entry zone
                 wait_secs = next_entry_zone_wait(self.interval_secs, self.entry_window_secs)
                 if wait_secs > 0:
-                    remaining = window_seconds_remaining(self.interval_secs)
+                    remaining = int(deadline - time.time())
                     logger.info(
                         f"Waiting {wait_secs:.0f}s for entry zone "
                         f"({remaining}s remaining in window)"
@@ -230,7 +236,7 @@ class CryptoTrader:
                 if skip_reason:
                     logger.info(f"Skipping window: {skip_reason}")
                     self._log_window(skip_reason=skip_reason)
-                    self._sleep_past_window()
+                    self._sleep_until(deadline + 5)
                     continue
 
                 # 3. Check hourly trade limit
@@ -240,7 +246,7 @@ class CryptoTrader:
                         f"Hourly trade limit reached ({self._hourly_trades}/{self.max_trades_per_hour})"
                     )
                     self._log_window(skip_reason="hourly_limit")
-                    self._sleep_past_window()
+                    self._sleep_until(deadline + 5)
                     continue
 
                 # 4. Discover current window market
@@ -248,17 +254,17 @@ class CryptoTrader:
                 if not market:
                     logger.warning("Could not find market for current window, skipping")
                     self._log_window(skip_reason="no_market")
-                    self._sleep_past_window()
+                    self._sleep_until(deadline + 5)
                     continue
 
                 # 5. Try to trade within the entry zone
                 traded = self._entry_zone_loop(market)
 
                 # 6. Wait for window to close
-                remaining = window_seconds_remaining(self.interval_secs)
-                if remaining > 0:
-                    logger.info(f"Waiting {remaining}s for window to close...")
-                    if not self._interruptible_sleep(remaining + 5):
+                wait_for_close = deadline - time.time()
+                if wait_for_close > 0:
+                    logger.info(f"Waiting {wait_for_close:.0f}s for window to close...")
+                    if not self._interruptible_sleep(wait_for_close + 5):
                         break
 
                 # 7. Check resolution (whether we traded or not, log the window)
@@ -284,10 +290,16 @@ class CryptoTrader:
         down_token_id = market["down_token_id"]
         clob_failures = 0
 
+        # Compute absolute deadline for this window (avoids wrapping bug where
+        # window_seconds_remaining() jumps to ~900 after window closes)
+        window_ts = int(time.time() // self.interval_secs) * self.interval_secs
+        deadline = window_ts + self.interval_secs
+
         while self._running:
-            remaining = window_seconds_remaining(self.interval_secs)
-            if remaining <= 0:
+            now = time.time()
+            if now >= deadline:
                 break
+            remaining = int(deadline - now)
 
             # Get spot momentum
             momentum = self.spot_feed.get_momentum(window_secs=30)
@@ -698,8 +710,17 @@ class CryptoTrader:
 
     def _sleep_past_window(self):
         """Sleep until the current window closes + buffer."""
-        remaining = window_seconds_remaining(self.interval_secs)
-        self._interruptible_sleep(remaining + 5)
+        now = time.time()
+        window_ts = int(now // self.interval_secs) * self.interval_secs
+        deadline = window_ts + self.interval_secs
+        self._sleep_until(deadline + 5)
+
+    def _sleep_until(self, target_time: float) -> bool:
+        """Sleep until an absolute timestamp. Returns True if completed."""
+        wait = target_time - time.time()
+        if wait > 0:
+            return self._interruptible_sleep(wait)
+        return self._running
 
     def _interruptible_sleep(self, seconds: float) -> bool:
         """Sleep that can be interrupted by shutdown signal.
