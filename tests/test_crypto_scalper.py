@@ -12,7 +12,7 @@ from strategies.crypto_scalper import CryptoScalper, crypto_fee_rate
 @pytest.fixture
 def scalper():
     return CryptoScalper(
-        min_momentum=0.001,      # 10bps
+        min_momentum=0.002,      # 20bps
         min_entry_price=0.05,
         max_entry_price=0.55,
         base_position_size=20.0,
@@ -39,9 +39,9 @@ class TestCryptoScalperSignals:
         assert signal.edge > 0
 
     def test_no_signal_weak_momentum(self, scalper):
-        """Weak BTC move (5bps < 10bps threshold) → None."""
+        """Weak BTC move (10bps < 20bps threshold) → None."""
         signal = scalper.evaluate(
-            spot_momentum=0.0005,  # 5bps, below 10bps threshold
+            spot_momentum=0.001,  # 10bps, below 20bps threshold
             window_seconds_remaining=30,
             up_price=0.30,
             down_price=0.70,
@@ -139,7 +139,7 @@ class TestCryptoScalperSignals:
         """Stronger momentum → larger position (up to 2x base)."""
         # 1x threshold → 1x size
         sig_1x = scalper.evaluate(
-            spot_momentum=0.001,  # Exactly at threshold
+            spot_momentum=0.002,  # Exactly at threshold
             window_seconds_remaining=30,
             up_price=0.30,
             down_price=0.70,
@@ -152,7 +152,7 @@ class TestCryptoScalperSignals:
 
         # 2x threshold → 2x size
         sig_2x = scalper.evaluate(
-            spot_momentum=0.002,  # 2x threshold
+            spot_momentum=0.004,  # 2x threshold
             window_seconds_remaining=30,
             up_price=0.30,
             down_price=0.70,
@@ -165,7 +165,7 @@ class TestCryptoScalperSignals:
 
         # 5x threshold → capped at 2x size
         sig_5x = scalper.evaluate(
-            spot_momentum=0.005,  # 5x threshold
+            spot_momentum=0.010,  # 5x threshold
             window_seconds_remaining=30,
             up_price=0.30,
             down_price=0.70,

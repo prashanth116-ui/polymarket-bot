@@ -66,7 +66,7 @@ BINANCE_WS_URL = "wss://stream.binance.us:9443/ws"
 # Crypto scalper defaults
 CRYPTO_DEFAULT_POSITION_SIZE = 20.0  # USDC per trade (base — scaled by momentum)
 CRYPTO_DEFAULT_INTERVAL_MINS = 15
-CRYPTO_DEFAULT_MIN_MOMENTUM = 0.001  # 10bps (was 3bps — too noisy)
+CRYPTO_DEFAULT_MIN_MOMENTUM = 0.002  # 20bps (was 10bps — still caught noise)
 CRYPTO_DEFAULT_ENTRY_WINDOW_SECS = 60
 CRYPTO_DEFAULT_MIN_ENTRY_PRICE = 0.05  # Don't buy tokens market thinks are worthless
 CRYPTO_DEFAULT_MAX_ENTRY_PRICE = 0.55  # Don't buy above 55¢ (fees + move already priced in)

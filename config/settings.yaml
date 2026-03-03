@@ -115,7 +115,7 @@ crypto_scalper:
   interval_minutes: 15
   bankroll: 200  # Separate bankroll from edge strategy
   position_size: 20  # USDC per trade (base — scaled 1x-2x by momentum strength)
-  min_momentum: 0.001  # 10bps BTC move in 30s (was 3bps — too noisy)
+  min_momentum: 0.002  # 20bps BTC move in 30s (was 10bps — still caught noise)
   min_entry_price: 0.05  # Don't buy tokens the market thinks are worthless
   max_entry_price: 0.55  # Don't buy above 55¢ (fees eat edge, move already priced in)
   entry_window_secs: 60  # Trade in last 60s of window
