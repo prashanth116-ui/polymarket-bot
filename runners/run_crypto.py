@@ -1,8 +1,16 @@
-"""Crypto scalper runner — trades Polymarket 15-min BTC up/down markets.
+"""Crypto scalper runner V2 — trades Polymarket 15-min BTC up/down markets.
 
 Separate process from the edge strategy bot. Runs a tight loop synced to
 15-minute window boundaries, trading in the last ~60 seconds when BTC spot
 direction is clear but Polymarket odds haven't caught up.
+
+V2 changes (from V1):
+- Fixed resolution detection: uses Gamma API outcomePrices (CLOB 404s after window close)
+- Added consecutive loss breaker (3 losses → pause 1 hour)
+- Added daily drawdown limit ($50)
+- Added CSV window logging for offline analysis
+- Handles CLOB 404s gracefully (max 3 failures → skip window)
+- Better position tracking and P/L reporting
 
 Usage:
     python -m runners.run_crypto --paper
@@ -10,7 +18,10 @@ Usage:
 """
 
 import argparse
+import csv
+import json as _json
 import logging
+import os
 import signal
 import sys
 import time
@@ -24,9 +35,11 @@ from core.constants import (
     CRYPTO_DEFAULT_BANKROLL,
     CRYPTO_DEFAULT_ENTRY_WINDOW_SECS,
     CRYPTO_DEFAULT_INTERVAL_MINS,
+    CRYPTO_DEFAULT_MAX_CONSEC_LOSSES,
+    CRYPTO_DEFAULT_MAX_DAILY_LOSS,
     CRYPTO_DEFAULT_MAX_ENTRY_PRICE,
+    CRYPTO_DEFAULT_MIN_ENTRY_PRICE,
     CRYPTO_DEFAULT_MIN_MOMENTUM,
-    CRYPTO_DEFAULT_MIN_PRICE_GAP,
     CRYPTO_DEFAULT_POSITION_SIZE,
     GAMMA_API_URL,
 )
@@ -73,7 +86,7 @@ def next_entry_zone_wait(interval_secs: int = 900, entry_window_secs: int = 60) 
 
 
 class CryptoTrader:
-    """Main crypto scalper trading loop."""
+    """Main crypto scalper trading loop (V2)."""
 
     def __init__(
         self,
@@ -82,15 +95,19 @@ class CryptoTrader:
         position_size: float = CRYPTO_DEFAULT_POSITION_SIZE,
         bankroll: float = CRYPTO_DEFAULT_BANKROLL,
         min_momentum: float = CRYPTO_DEFAULT_MIN_MOMENTUM,
-        min_price_gap: float = CRYPTO_DEFAULT_MIN_PRICE_GAP,
+        min_entry_price: float = CRYPTO_DEFAULT_MIN_ENTRY_PRICE,
         max_entry_price: float = CRYPTO_DEFAULT_MAX_ENTRY_PRICE,
         entry_window_secs: int = CRYPTO_DEFAULT_ENTRY_WINDOW_SECS,
         max_trades_per_hour: int = 4,
+        max_consec_losses: int = CRYPTO_DEFAULT_MAX_CONSEC_LOSSES,
+        max_daily_loss: float = CRYPTO_DEFAULT_MAX_DAILY_LOSS,
     ):
         self.asset = asset
         self.interval_secs = interval_mins * 60
         self.entry_window_secs = entry_window_secs
         self.max_trades_per_hour = max_trades_per_hour
+        self.max_consec_losses = max_consec_losses
+        self.max_daily_loss = max_daily_loss
         self._running = False
 
         # Components
@@ -105,9 +122,9 @@ class CryptoTrader:
         self.notifier = TelegramNotifier()
         self.strategy = CryptoScalper(
             min_momentum=min_momentum,
-            min_price_gap=min_price_gap,
+            min_entry_price=min_entry_price,
             max_entry_price=max_entry_price,
-            position_size=position_size,
+            base_position_size=position_size,
             entry_window_secs=entry_window_secs,
         )
 
@@ -116,9 +133,23 @@ class CryptoTrader:
         self._current_window_ts = 0  # Window start timestamp for cache invalidation
         self._hourly_trades = 0
         self._hourly_reset_ts = 0
+
+        # P/L tracking
         self._total_trades = 0
         self._total_wins = 0
         self._total_losses = 0
+        self._consec_losses = 0
+        self._daily_pnl = 0.0
+        self._daily_reset_date = ""
+        self._consec_pause_until = 0  # Timestamp when consec loss pause ends
+
+        # Pending trade (waiting for resolution)
+        self._pending_trade = None  # {market, direction, outcome, cost_basis, size, entry_price}
+
+        # CSV logging
+        self._csv_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "logs", "crypto_windows.csv"
+        )
 
     def run(self):
         """Main trading loop, synced to 15-minute window boundaries."""
@@ -127,11 +158,15 @@ class CryptoTrader:
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
         logger.info(
-            f"CryptoTrader starting | asset={self.asset.upper()} | "
+            f"CryptoTrader V2 starting | asset={self.asset.upper()} | "
             f"interval={self.interval_secs // 60}m | "
             f"entry_window={self.entry_window_secs}s | "
-            f"position_size=${self.strategy.position_size:.2f} | "
-            f"bankroll=${self.executor.balance:.2f}"
+            f"position_size=${self.strategy.base_position_size:.2f} | "
+            f"bankroll=${self.executor.balance:.2f} | "
+            f"min_momentum={self.strategy.min_momentum:.4f} | "
+            f"price_range=${self.strategy.min_entry_price:.2f}-${self.strategy.max_entry_price:.2f} | "
+            f"max_consec_losses={self.max_consec_losses} | "
+            f"max_daily_loss=${self.max_daily_loss:.2f}"
         )
 
         self.spot_feed.start()
@@ -143,21 +178,28 @@ class CryptoTrader:
             time.sleep(1)
 
         if not self.spot_feed.connected:
-            logger.error("Failed to connect to Binance spot feed after 30s")
-            self.notifier.send_error("Crypto scalper: Binance WS connection failed")
+            logger.error("Failed to connect to spot feed after 30s")
+            self.notifier.send_error("Crypto scalper: spot feed connection failed")
             return
 
         spot_data = self.spot_feed.get_price()
         if spot_data:
-            logger.info(f"Binance connected | {self.asset.upper()}/USDT = ${spot_data[0]:,.2f}")
+            logger.info(f"Spot feed connected | {self.asset.upper()}/USD = ${spot_data[0]:,.2f}")
 
         self.notifier.send(
-            f"<b>Crypto Scalper Started</b>\n"
+            f"<b>Crypto Scalper V2 Started</b>\n"
             f"Asset: {self.asset.upper()}\n"
             f"Interval: {self.interval_secs // 60}m\n"
             f"Balance: ${self.executor.balance:.2f}\n"
-            f"Position size: ${self.strategy.position_size:.2f}"
+            f"Position size: ${self.strategy.base_position_size:.2f}\n"
+            f"Min momentum: {self.strategy.min_momentum:.2%}\n"
+            f"Price range: ${self.strategy.min_entry_price:.2f}-${self.strategy.max_entry_price:.2f}\n"
+            f"Consec loss limit: {self.max_consec_losses}\n"
+            f"Daily loss limit: ${self.max_daily_loss:.2f}"
         )
+
+        # Initialize CSV
+        self._init_csv()
 
         try:
             self._main_loop()
@@ -168,7 +210,7 @@ class CryptoTrader:
             self._shutdown()
 
     def _main_loop(self):
-        """Core loop: sleep until entry zone → evaluate → trade → wait for resolution."""
+        """Core loop: sleep until entry zone -> evaluate -> trade -> wait for resolution."""
         while self._running:
             try:
                 # 1. Sleep until entry zone
@@ -182,36 +224,51 @@ class CryptoTrader:
                     if not self._interruptible_sleep(wait_secs):
                         break
 
-                # 2. Check hourly trade limit
+                # 2. Check risk controls
+                self._check_daily_reset()
+                skip_reason = self._check_risk_controls()
+                if skip_reason:
+                    logger.info(f"Skipping window: {skip_reason}")
+                    self._log_window(skip_reason=skip_reason)
+                    self._sleep_past_window()
+                    continue
+
+                # 3. Check hourly trade limit
                 self._check_hourly_reset()
                 if self._hourly_trades >= self.max_trades_per_hour:
                     logger.info(
-                        f"Hourly trade limit reached ({self._hourly_trades}/{self.max_trades_per_hour}), "
-                        f"skipping window"
+                        f"Hourly trade limit reached ({self._hourly_trades}/{self.max_trades_per_hour})"
                     )
+                    self._log_window(skip_reason="hourly_limit")
                     self._sleep_past_window()
                     continue
 
-                # 3. Discover current window market
+                # 4. Discover current window market
                 market = self._discover_market()
                 if not market:
                     logger.warning("Could not find market for current window, skipping")
+                    self._log_window(skip_reason="no_market")
                     self._sleep_past_window()
                     continue
 
-                # 4. Try to trade within the entry zone
+                # 5. Try to trade within the entry zone
                 traded = self._entry_zone_loop(market)
 
-                # 5. Wait for window to close
+                # 6. Wait for window to close
                 remaining = window_seconds_remaining(self.interval_secs)
                 if remaining > 0:
                     logger.info(f"Waiting {remaining}s for window to close...")
                     if not self._interruptible_sleep(remaining + 5):
                         break
 
-                # 6. Check resolution
+                # 7. Check resolution (whether we traded or not, log the window)
                 if traded:
                     self._check_resolution(market)
+                else:
+                    self._log_window(
+                        market=market,
+                        skip_reason="no_signal",
+                    )
 
             except Exception as e:
                 logger.error(f"Loop iteration error: {e}", exc_info=True)
@@ -225,6 +282,7 @@ class CryptoTrader:
         condition_id = market["condition_id"]
         up_token_id = market["up_token_id"]
         down_token_id = market["down_token_id"]
+        clob_failures = 0
 
         while self._running:
             remaining = window_seconds_remaining(self.interval_secs)
@@ -238,14 +296,23 @@ class CryptoTrader:
             if spot_data:
                 logger.debug(f"BTC=${spot_data[0]:,.2f} momentum={momentum}")
 
-            # Get Polymarket prices
+            # Get Polymarket prices (handle CLOB 404s gracefully)
             up_price = self.clob.get_midpoint(up_token_id)
             down_price = self.clob.get_midpoint(down_token_id)
 
             if up_price is None or down_price is None:
-                logger.debug("Could not fetch Polymarket prices, retrying...")
-                time.sleep(3)
+                clob_failures += 1
+                if clob_failures >= 3:
+                    logger.warning(
+                        f"CLOB returned {clob_failures} consecutive failures — "
+                        f"tokens may not be listed yet, skipping window"
+                    )
+                    return False
+                logger.debug(f"CLOB price fetch failed ({clob_failures}/3), retrying...")
+                time.sleep(5)
                 continue
+
+            clob_failures = 0  # Reset on success
 
             # Evaluate strategy
             sig = self.strategy.evaluate(
@@ -275,6 +342,20 @@ class CryptoTrader:
                 self._hourly_trades += 1
                 self._total_trades += 1
 
+                # Store pending trade for resolution
+                self._pending_trade = {
+                    "market": market,
+                    "direction": direction,
+                    "outcome": sig.outcome,
+                    "cost_basis": result.cost,
+                    "size": result.size,
+                    "entry_price": result.price,
+                    "token_id": token_id,
+                    "momentum": momentum,
+                    "up_price": up_price,
+                    "down_price": down_price,
+                }
+
                 # Record trade
                 self.storage.record_trade(
                     market_id=sig.market_id,
@@ -299,13 +380,15 @@ class CryptoTrader:
                     f"Size: ${result.cost:.2f}\n"
                     f"Edge: {sig.edge:.1%}\n"
                     f"Window: {remaining}s remaining\n"
-                    f"Balance: ${self.executor.balance:.2f}"
+                    f"Balance: ${self.executor.balance:.2f}\n"
+                    f"Record: {self._total_wins}W-{self._total_losses}L"
                 )
 
                 logger.info(
                     f"ENTRY {direction} | BTC=${spot_price:,.2f} | "
                     f"momentum={momentum:.4%} | "
-                    f"{sig.outcome.value} @ ${result.price:.4f} x {result.size:.2f}"
+                    f"{sig.outcome.value} @ ${result.price:.4f} x {result.size:.2f} | "
+                    f"cost=${result.cost:.2f}"
                 )
                 return True
 
@@ -317,11 +400,9 @@ class CryptoTrader:
     def _discover_market(self) -> Optional[dict]:
         """Find the Polymarket market for the current 15-min window.
 
-        Uses the Gamma events endpoint with the exact slug (e.g. btc-updown-15m-1772506800).
+        Uses the Gamma events endpoint with the exact slug.
         Returns dict with condition_id, up_token_id, down_token_id or None.
         """
-        import json as _json
-
         # Cache check — same window?
         window_ts = int(time.time() // self.interval_secs) * self.interval_secs
         if self._current_window_market and self._current_window_ts == window_ts:
@@ -330,7 +411,6 @@ class CryptoTrader:
         slug = current_window_slug(self.asset, self.interval_secs)
         logger.info(f"Discovering market for slug: {slug}")
 
-        # Fetch from Gamma events endpoint (not markets search)
         try:
             resp = requests.get(
                 f"{GAMMA_API_URL}/events",
@@ -390,6 +470,7 @@ class CryptoTrader:
             "question": question,
             "up_token_id": up_token_id,
             "down_token_id": down_token_id,
+            "slug": slug,
         }
 
         # Cache for this window
@@ -403,121 +484,210 @@ class CryptoTrader:
         return result
 
     def _check_resolution(self, market: dict):
-        """Check how the window resolved and record P/L.
+        """Check how the window resolved using Gamma API outcomePrices.
 
-        Uses token prices as primary signal (go to ~1.0/~0.0 on resolution),
-        falls back to Gamma API for confirmation.
+        outcomePrices=["1", "0"] → Up won
+        outcomePrices=["0", "1"] → Down won
         """
+        slug = market.get("slug", "")
         condition_id = market["condition_id"]
-        up_token = market["up_token_id"]
-        down_token = market["down_token_id"]
 
-        # Poll for resolution (market resolves 5-30s after window close)
-        resolved = False
+        if not self._pending_trade:
+            logger.warning("No pending trade to resolve")
+            return
+
+        trade = self._pending_trade
+        direction = trade["direction"]
+        outcome = trade["outcome"]
+        cost_basis = trade["cost_basis"]
+        entry_size = trade["size"]
+
+        # Poll Gamma API for resolution (markets resolve 5-30s after window close)
         resolution = None
 
         for attempt in range(24):  # Up to 120 seconds of polling
             time.sleep(5)
 
-            # Primary: check token prices — they snap to ~1.0/~0.0 on resolution
-            up_price = self.clob.get_midpoint(up_token)
-            down_price = self.clob.get_midpoint(down_token)
+            try:
+                resp = requests.get(
+                    f"{GAMMA_API_URL}/events",
+                    params={"slug": slug},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    events = resp.json()
+                    if events:
+                        mkt = events[0].get("markets", [{}])[0]
+                        outcome_prices = mkt.get("outcomePrices", "")
 
-            if up_price is not None and up_price > 0.90:
-                resolution = "Up"
-                logger.info(f"Up token at ${up_price:.4f} — resolved UP")
-            elif down_price is not None and down_price > 0.90:
-                resolution = "Down"
-                logger.info(f"Down token at ${down_price:.4f} — resolved DOWN")
+                        if isinstance(outcome_prices, str):
+                            try:
+                                prices = _json.loads(outcome_prices)
+                            except (ValueError, TypeError):
+                                prices = []
+                        else:
+                            prices = outcome_prices or []
 
-            # Fallback: check Gamma API for explicit resolution
-            if resolution is None:
-                try:
-                    resp = requests.get(
-                        f"{GAMMA_API_URL}/markets",
-                        params={"conditionId": condition_id},
-                        timeout=10,
-                    )
-                    if resp.status_code == 200:
-                        markets_data = resp.json()
-                        if markets_data and isinstance(markets_data, list):
-                            res = markets_data[0].get("resolution")
-                            if res:
-                                resolution = res
-                                logger.info(f"Gamma API resolution: {resolution}")
-                except Exception as e:
-                    logger.debug(f"Gamma resolution check error: {e}")
+                        # outcomePrices: ["1","0"] = Up won, ["0","1"] = Down won
+                        if len(prices) >= 2:
+                            up_resolved = float(prices[0])
+                            down_resolved = float(prices[1])
 
-            if resolution is None:
-                if attempt < 23:
-                    logger.debug(f"Resolution poll {attempt+1}/24 — waiting...")
-                continue
+                            if up_resolved > 0.5:
+                                resolution = "UP"
+                                logger.info(
+                                    f"Resolution: UP (outcomePrices={prices})"
+                                )
+                            elif down_resolved > 0.5:
+                                resolution = "DOWN"
+                                logger.info(
+                                    f"Resolution: DOWN (outcomePrices={prices})"
+                                )
+            except Exception as e:
+                logger.debug(f"Resolution poll error: {e}")
 
-            # Map resolution to the outcome we hold
-            # Our position outcome is YES (bought Up) or NO (bought Down)
-            resolved = True
-            positions = self.executor.get_positions()
-            for pos in positions:
-                if pos.market_id == condition_id:
-                    # Determine if we won
-                    if pos.outcome == Outcome.YES:
-                        won = resolution == "Up"
-                    else:
-                        won = resolution == "Down"
+            if resolution:
+                break
 
-                    pnl = pos.size - pos.cost_basis if won else -pos.cost_basis
-                    if won:
-                        self._total_wins += 1
-                    else:
-                        self._total_losses += 1
+            if attempt < 23:
+                logger.debug(f"Resolution poll {attempt+1}/24 — waiting...")
 
-                    # Resolve in executor (payout $1/share if won, $0 if lost)
-                    res_outcome = "YES" if resolution == "Up" else "NO"
-                    self.executor.resolve_position(
-                        market_id=condition_id,
-                        outcome=pos.outcome,
-                        resolution=res_outcome,
-                    )
-
-                    self.notifier.send(
-                        f"{'<b>WIN</b>' if won else '<b>LOSS</b>'}\n"
-                        f"Market: {market['question']}\n"
-                        f"Resolution: {resolution}\n"
-                        f"P/L: ${pnl:+.2f}\n"
-                        f"Balance: ${self.executor.balance:.2f}\n"
-                        f"Record: {self._total_wins}W-{self._total_losses}L"
-                    )
-
-                    self.storage.record_trade(
-                        market_id=condition_id,
-                        outcome=pos.outcome.value,
-                        side="SELL",
-                        price=1.0 if won else 0.0,
-                        size=pos.size,
-                        cost=pos.size if won else 0.0,
-                        fee=0,
-                        strategy="crypto_scalper",
-                        exit_reason="window_expired",
-                    )
-            break
-
-        if not resolved:
+        if resolution is None:
             logger.warning(
-                f"Window did not resolve within 120s — "
-                f"selling position at market price"
+                f"Window did not resolve within 120s — recording as loss"
             )
-            positions = self.executor.get_positions()
-            for pos in positions:
-                if pos.market_id == condition_id:
-                    current_price = self.clob.get_midpoint(pos.token_id) or 0.5
-                    self.executor.sell(
-                        market_id=condition_id,
-                        token_id=pos.token_id,
-                        outcome=pos.outcome,
-                        price=current_price,
-                        size=pos.size,
-                        exit_reason=ExitReason.WINDOW_EXPIRED,
-                    )
+            resolution = "UNKNOWN"
+
+        # Determine win/loss
+        won = (direction == resolution)
+
+        if won:
+            # Token resolves to $1/share
+            pnl = entry_size - cost_basis  # size shares * $1 each - cost
+            self._total_wins += 1
+            self._consec_losses = 0
+        else:
+            # Token resolves to $0/share
+            pnl = -cost_basis
+            self._total_losses += 1
+            self._consec_losses += 1
+
+        self._daily_pnl += pnl
+
+        # Resolve in executor
+        if resolution != "UNKNOWN":
+            res_outcome = "YES" if resolution == "UP" else "NO"
+            self.executor.resolve_position(
+                market_id=condition_id,
+                outcome=outcome,
+                resolution=res_outcome,
+            )
+        else:
+            # Force sell at 0 (unknown resolution = assume loss)
+            self.executor.sell(
+                market_id=condition_id,
+                token_id=trade["token_id"],
+                outcome=outcome,
+                price=0.0,
+                size=entry_size,
+                exit_reason=ExitReason.WINDOW_EXPIRED,
+            )
+
+        # Record exit trade
+        self.storage.record_trade(
+            market_id=condition_id,
+            outcome=outcome.value,
+            side="SELL",
+            price=1.0 if won else 0.0,
+            size=entry_size,
+            cost=entry_size if won else 0.0,
+            fee=0,
+            strategy="crypto_scalper",
+            exit_reason="window_expired",
+        )
+
+        # Log to CSV
+        self._log_window(
+            market=market,
+            traded=True,
+            direction=direction,
+            entry_price=trade["entry_price"],
+            cost_basis=cost_basis,
+            resolution=resolution,
+            won=won,
+            pnl=pnl,
+            momentum=trade.get("momentum"),
+            up_price=trade.get("up_price"),
+            down_price=trade.get("down_price"),
+        )
+
+        # Telegram alert
+        result_emoji = "WIN" if won else "LOSS"
+        self.notifier.send(
+            f"<b>{result_emoji}</b>\n"
+            f"Market: {market['question']}\n"
+            f"Direction: {direction}\n"
+            f"Resolution: {resolution}\n"
+            f"Entry: ${trade['entry_price']:.4f}\n"
+            f"P/L: ${pnl:+.2f}\n"
+            f"Balance: ${self.executor.balance:.2f}\n"
+            f"Daily P/L: ${self._daily_pnl:+.2f}\n"
+            f"Record: {self._total_wins}W-{self._total_losses}L\n"
+            f"Consec losses: {self._consec_losses}"
+        )
+
+        logger.info(
+            f"{'WIN' if won else 'LOSS'} | {direction} vs {resolution} | "
+            f"entry=${trade['entry_price']:.4f} | P/L=${pnl:+.2f} | "
+            f"balance=${self.executor.balance:.2f} | "
+            f"daily_pnl=${self._daily_pnl:+.2f} | "
+            f"record={self._total_wins}W-{self._total_losses}L | "
+            f"consec_losses={self._consec_losses}"
+        )
+
+        # Clear pending trade
+        self._pending_trade = None
+
+    def _check_risk_controls(self) -> Optional[str]:
+        """Check if risk controls prevent trading. Returns skip reason or None."""
+        # Consecutive loss pause
+        if self._consec_pause_until > time.time():
+            remaining = int(self._consec_pause_until - time.time())
+            return f"consec_loss_pause ({remaining}s remaining)"
+
+        if self._consec_losses >= self.max_consec_losses:
+            self._consec_pause_until = time.time() + 3600  # Pause 1 hour
+            logger.warning(
+                f"Consecutive loss limit reached ({self._consec_losses}), "
+                f"pausing for 1 hour"
+            )
+            self.notifier.send(
+                f"<b>CONSEC LOSS PAUSE</b>\n"
+                f"Consecutive losses: {self._consec_losses}\n"
+                f"Pausing for 1 hour\n"
+                f"Daily P/L: ${self._daily_pnl:+.2f}"
+            )
+            return f"consec_losses={self._consec_losses}"
+
+        # Daily drawdown limit
+        if self._daily_pnl <= -self.max_daily_loss:
+            return f"daily_loss_limit (${self._daily_pnl:+.2f})"
+
+        return None
+
+    def _check_daily_reset(self):
+        """Reset daily P/L at midnight UTC."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._daily_reset_date:
+            if self._daily_reset_date:
+                logger.info(
+                    f"Daily reset | yesterday P/L: ${self._daily_pnl:+.2f} | "
+                    f"record: {self._total_wins}W-{self._total_losses}L"
+                )
+            self._daily_pnl = 0.0
+            self._consec_losses = 0
+            self._consec_pause_until = 0
+            self._daily_reset_date = today
 
     def _check_hourly_reset(self):
         """Reset hourly trade counter at the start of each hour."""
@@ -570,27 +740,99 @@ class CryptoTrader:
         summary["crypto_wins"] = self._total_wins
         summary["crypto_losses"] = self._total_losses
         self.notifier.send(
-            f"<b>Crypto Scalper Stopped</b>\n"
+            f"<b>Crypto Scalper V2 Stopped</b>\n"
             f"Trades: {self._total_trades} "
             f"({self._total_wins}W-{self._total_losses}L)\n"
             f"Balance: ${summary['balance']:.2f}\n"
-            f"Total P/L: ${summary['total_pnl']:.2f}"
+            f"Total P/L: ${summary['total_pnl']:.2f}\n"
+            f"Daily P/L: ${self._daily_pnl:+.2f}"
         )
 
         self.spot_feed.stop()
         self.storage.close()
         logger.info("CryptoTrader shutdown complete")
 
+    def _init_csv(self):
+        """Initialize CSV log file with headers if it doesn't exist."""
+        log_dir = os.path.dirname(self._csv_path)
+        os.makedirs(log_dir, exist_ok=True)
+
+        if not os.path.exists(self._csv_path):
+            with open(self._csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp", "window_slug", "question",
+                    "btc_price", "momentum", "up_price", "down_price",
+                    "traded", "direction", "entry_price", "cost_basis",
+                    "resolution", "won", "pnl",
+                    "skip_reason", "balance", "daily_pnl",
+                    "consec_losses", "total_wins", "total_losses",
+                ])
+
+    def _log_window(
+        self,
+        market: Optional[dict] = None,
+        traded: bool = False,
+        direction: str = "",
+        entry_price: float = 0.0,
+        cost_basis: float = 0.0,
+        resolution: str = "",
+        won: Optional[bool] = None,
+        pnl: float = 0.0,
+        skip_reason: str = "",
+        momentum: Optional[float] = None,
+        up_price: Optional[float] = None,
+        down_price: Optional[float] = None,
+    ):
+        """Log window data to CSV for offline analysis."""
+        try:
+            spot_data = self.spot_feed.get_price()
+            btc_price = spot_data[0] if spot_data else 0.0
+            if momentum is None:
+                momentum = self.spot_feed.get_momentum(window_secs=30)
+
+            slug = market.get("slug", "") if market else current_window_slug(self.asset, self.interval_secs)
+            question = market.get("question", "") if market else ""
+
+            with open(self._csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now(timezone.utc).isoformat(),
+                    slug,
+                    question,
+                    f"{btc_price:.2f}",
+                    f"{momentum:.8f}" if momentum is not None else "",
+                    f"{up_price:.4f}" if up_price is not None else "",
+                    f"{down_price:.4f}" if down_price is not None else "",
+                    traded,
+                    direction,
+                    f"{entry_price:.4f}" if entry_price else "",
+                    f"{cost_basis:.2f}" if cost_basis else "",
+                    resolution,
+                    won if won is not None else "",
+                    f"{pnl:.2f}" if traded else "",
+                    skip_reason,
+                    f"{self.executor.balance:.2f}",
+                    f"{self._daily_pnl:.2f}",
+                    self._consec_losses,
+                    self._total_wins,
+                    self._total_losses,
+                ])
+        except Exception as e:
+            logger.debug(f"CSV logging error: {e}")
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Crypto scalper for Polymarket up/down markets")
+    parser = argparse.ArgumentParser(description="Crypto scalper V2 for Polymarket up/down markets")
     parser.add_argument("--paper", action="store_true", default=True, help="Paper trading mode (default)")
     parser.add_argument("--asset", default="btc", help="Asset to trade (default: btc)")
-    parser.add_argument("--interval", type=int, default=CRYPTO_DEFAULT_INTERVAL_MINS, help="Window interval in minutes (default: 15)")
-    parser.add_argument("--position-size", type=float, default=None, help="USDC per trade")
+    parser.add_argument("--interval", type=int, default=CRYPTO_DEFAULT_INTERVAL_MINS, help="Window interval in minutes")
+    parser.add_argument("--position-size", type=float, default=None, help="USDC per trade (base)")
     parser.add_argument("--bankroll", type=float, default=None, help="Starting bankroll")
     parser.add_argument("--min-momentum", type=float, default=None, help="Minimum BTC momentum (fraction)")
     parser.add_argument("--entry-window", type=int, default=None, help="Entry window seconds before close")
+    parser.add_argument("--max-consec-losses", type=int, default=None, help="Stop after N consecutive losses")
+    parser.add_argument("--max-daily-loss", type=float, default=None, help="Max daily loss in USDC")
     args = parser.parse_args()
 
     # Load settings with CLI overrides
@@ -601,6 +843,8 @@ def main():
     bankroll = args.bankroll or crypto_cfg.get("bankroll", CRYPTO_DEFAULT_BANKROLL)
     min_momentum = args.min_momentum or crypto_cfg.get("min_momentum", CRYPTO_DEFAULT_MIN_MOMENTUM)
     entry_window = args.entry_window or crypto_cfg.get("entry_window_secs", CRYPTO_DEFAULT_ENTRY_WINDOW_SECS)
+    max_consec = args.max_consec_losses or crypto_cfg.get("max_consec_losses", CRYPTO_DEFAULT_MAX_CONSEC_LOSSES)
+    max_daily = args.max_daily_loss or crypto_cfg.get("max_daily_loss", CRYPTO_DEFAULT_MAX_DAILY_LOSS)
 
     # Setup logging — use StreamHandler only (systemd captures stdout to log file)
     logging.basicConfig(
@@ -615,6 +859,8 @@ def main():
         bankroll=bankroll,
         min_momentum=min_momentum,
         entry_window_secs=entry_window,
+        max_consec_losses=max_consec,
+        max_daily_loss=max_daily,
     )
     trader.run()
 
