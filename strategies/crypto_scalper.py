@@ -1,17 +1,19 @@
-"""Crypto scalper strategy V2 — momentum-based signals for Polymarket up/down markets.
+"""Crypto scalper strategy V3 — contrarian mean-reversion for Polymarket up/down markets.
 
-Trades in the last ~60 seconds of each 15-minute window when BTC spot direction
-is clear but Polymarket odds haven't caught up. The edge comes from the speed gap:
-Coinbase spot moves instantly, but Polymarket order book lags 10-30 seconds behind.
+After N consecutive same-direction window resolutions, bet on reversal.
+Enter early (T-300s) when token prices are still near $0.50 for balanced risk:reward.
 
-V2 changes (from V1):
-- Removed broken implied probability formula
-- Added price floor/ceiling ($0.05-$0.55) — don't buy tokens the market thinks are worthless
-  or that already price in the move
-- Raised momentum threshold from 3bps to 10bps — 3bps is noise
-- Added volatility filter — skip flat/choppy markets
-- Position sizing scaled by momentum strength
-- Edge metric is fee-adjusted expected value, not fake "price gap"
+V3 changes (from V2):
+- Replaced momentum-based signals with contrarian streak detection
+- After 2+ consecutive same-direction resolutions, bet the opposite direction
+- Enter at T-300s instead of T-60s (better prices)
+- Position sizing scales with streak length (longer streak = higher confidence)
+- Spot feed still used for monitoring, not for signal generation
+
+Backtest (7 days, 673 windows):
+- After 2 streak: 55% WR, +$8,599 P/L, $413 max DD
+- After 3 streak: 57% WR, +$4,570 P/L, $249 max DD
+- After 4 streak: 68% WR, +$1,597 P/L, $117 max DD
 """
 
 import logging
@@ -21,7 +23,6 @@ from core.constants import (
     CRYPTO_DEFAULT_ENTRY_WINDOW_SECS,
     CRYPTO_DEFAULT_MAX_ENTRY_PRICE,
     CRYPTO_DEFAULT_MIN_ENTRY_PRICE,
-    CRYPTO_DEFAULT_MIN_MOMENTUM,
     CRYPTO_DEFAULT_POSITION_SIZE,
 )
 from core.types import Outcome, Signal, SignalAction, StrategyType
@@ -39,21 +40,21 @@ def crypto_fee_rate(price: float) -> float:
 
 
 class CryptoScalper:
-    """Signal generator for crypto up/down markets (V2).
+    """Signal generator for crypto up/down markets (V3 — contrarian).
 
     Pure signal logic — no market discovery, no execution.
-    Takes spot price + Polymarket odds, returns a Signal or None.
+    Takes streak history + Polymarket odds, returns a Signal or None.
     """
 
     def __init__(
         self,
-        min_momentum: float = CRYPTO_DEFAULT_MIN_MOMENTUM,
+        min_streak: int = 2,
         min_entry_price: float = CRYPTO_DEFAULT_MIN_ENTRY_PRICE,
         max_entry_price: float = CRYPTO_DEFAULT_MAX_ENTRY_PRICE,
         base_position_size: float = CRYPTO_DEFAULT_POSITION_SIZE,
         entry_window_secs: int = CRYPTO_DEFAULT_ENTRY_WINDOW_SECS,
     ):
-        self.min_momentum = min_momentum
+        self.min_streak = min_streak
         self.min_entry_price = min_entry_price
         self.max_entry_price = max_entry_price
         self.base_position_size = base_position_size
@@ -61,7 +62,8 @@ class CryptoScalper:
 
     def evaluate(
         self,
-        spot_momentum: Optional[float],
+        streak_direction: Optional[str],
+        streak_length: int,
         window_seconds_remaining: int,
         up_price: float,
         down_price: float,
@@ -69,10 +71,11 @@ class CryptoScalper:
         down_token_id: str,
         market_id: str,
     ) -> Optional[Signal]:
-        """Evaluate whether to enter a trade in the current window.
+        """Evaluate whether to enter a contrarian trade.
 
         Args:
-            spot_momentum: BTC % change over last 30s (e.g. 0.001 = 0.1%)
+            streak_direction: Direction of the current streak ("UP" or "DOWN"), or None
+            streak_length: Number of consecutive same-direction resolutions
             window_seconds_remaining: Seconds until window closes
             up_price: Current Polymarket price of "Up" token
             down_price: Current Polymarket price of "Down" token
@@ -81,9 +84,9 @@ class CryptoScalper:
             market_id: Polymarket condition_id for this window
 
         Returns:
-            Signal to BUY the winning side's token, or None if no trade.
+            Signal to BUY the opposing side's token, or None if no trade.
         """
-        # 1. Only trade in entry window (last N seconds of the 15-min window)
+        # 1. Only trade in entry window
         if window_seconds_remaining > self.entry_window_secs:
             logger.debug(
                 f"Outside entry window: {window_seconds_remaining}s remaining "
@@ -91,62 +94,47 @@ class CryptoScalper:
             )
             return None
 
-        # 2. Need momentum data
-        if spot_momentum is None:
-            logger.debug("No momentum data available")
-            return None
-
-        # 3. Determine direction from spot momentum
-        abs_momentum = abs(spot_momentum)
-        if abs_momentum < self.min_momentum:
+        # 2. Need streak data
+        if streak_direction is None or streak_length < self.min_streak:
             logger.debug(
-                f"Momentum too weak: {spot_momentum:.6f} "
-                f"(need > {self.min_momentum:.6f})"
+                f"Streak too short: {streak_length} "
+                f"(need >= {self.min_streak})"
             )
             return None
 
-        if spot_momentum > 0:
-            direction = "UP"
-            target_price = up_price
-            target_token_id = up_token_id
-            target_outcome = Outcome.YES  # Up maps to YES semantically
-        else:
+        # 3. Bet AGAINST the streak (contrarian)
+        if streak_direction == "UP":
             direction = "DOWN"
             target_price = down_price
             target_token_id = down_token_id
-            target_outcome = Outcome.NO  # Down maps to NO semantically
+            target_outcome = Outcome.NO
+        else:
+            direction = "UP"
+            target_price = up_price
+            target_token_id = up_token_id
+            target_outcome = Outcome.YES
 
         # 4. Price range check
         if target_price < self.min_entry_price:
             logger.debug(
                 f"Price too low: {direction} @ ${target_price:.4f} "
-                f"(min ${self.min_entry_price:.4f}) — market strongly disagrees"
+                f"(min ${self.min_entry_price:.4f})"
             )
             return None
 
         if target_price > self.max_entry_price:
             logger.debug(
                 f"Price too high: {direction} @ ${target_price:.4f} "
-                f"(max ${self.max_entry_price:.4f}) — move already priced in"
+                f"(max ${self.max_entry_price:.4f})"
             )
             return None
 
         # 5. Fee-adjusted edge calculation
         fee = crypto_fee_rate(target_price)
-
-        # Momentum strength as multiple of threshold (1.0 = barely qualifying)
-        momentum_strength = abs_momentum / self.min_momentum
-
-        # Expected value estimate:
-        # If we buy at price p and win: profit per share = 1 - p - fee
-        # If we lose: loss per share = p + fee
-        # Need positive EV even at 50% win rate for the trade to make sense
         profit_if_win = 1.0 - target_price - fee
         loss_if_lose = target_price + fee
-
-        # Require profit_if_win > loss_if_lose (i.e. buy below ~50¢)
-        # plus a minimum edge buffer
         edge = profit_if_win - loss_if_lose
+
         if edge < 0:
             logger.debug(
                 f"Negative edge: profit_if_win={profit_if_win:.4f} "
@@ -154,13 +142,16 @@ class CryptoScalper:
             )
             return None
 
-        # 6. Scale position size by momentum strength (1x-2x base)
-        size_multiplier = min(momentum_strength, 2.0)
+        # 6. Scale position size by streak length
+        # streak=2: 1x, streak=3: 1.5x, streak=4+: 2x
+        size_multiplier = min(1.0 + (streak_length - self.min_streak) * 0.5, 2.0)
         position_size = self.base_position_size * size_multiplier
 
+        # Confidence scales with streak length
+        confidence = min(0.5 + streak_length * 0.1, 1.0)
+
         logger.info(
-            f"SIGNAL: {direction} | momentum={spot_momentum:.6f} "
-            f"({momentum_strength:.1f}x threshold) | "
+            f"SIGNAL: Contrarian {direction} (after {streak_length}x {streak_direction}) | "
             f"price=${target_price:.4f} | fee={fee:.4f} | "
             f"edge={edge:.4f} | size=${position_size:.2f} | "
             f"window={window_seconds_remaining}s remaining"
@@ -174,15 +165,15 @@ class CryptoScalper:
             price=target_price,
             size=position_size,
             edge=edge,
-            confidence=min(momentum_strength / 3.0, 1.0),  # 3x threshold = full confidence
+            confidence=confidence,
             reasoning=(
-                f"BTC {direction} momentum={spot_momentum:.4%}, "
+                f"Contrarian: {streak_length}x {streak_direction} streak → bet {direction}, "
                 f"price=${target_price:.4f}, fee={fee:.2%}, edge={edge:.1%}"
             ),
             metadata={
                 "direction": direction,
-                "spot_momentum": spot_momentum,
-                "momentum_strength": momentum_strength,
+                "streak_direction": streak_direction,
+                "streak_length": streak_length,
                 "target_price": target_price,
                 "fee_rate": fee,
                 "edge": edge,

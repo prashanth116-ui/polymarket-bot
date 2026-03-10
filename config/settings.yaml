@@ -108,17 +108,17 @@ telegram:
   enabled: true
   heartbeat_interval: 3600  # 1 hour
 
-# Crypto scalper (5M/15M up/down markets)
+# Crypto scalper V3 — contrarian (5M/15M up/down markets)
 crypto_scalper:
   enabled: false  # Start disabled, enable explicitly via CLI
   asset: btc
   interval_minutes: 15
   bankroll: 200  # Separate bankroll from edge strategy
-  position_size: 20  # USDC per trade (base — scaled 1x-2x by momentum strength)
-  min_momentum: 0.002  # 20bps BTC move in 30s (was 10bps — still caught noise)
+  position_size: 20  # USDC per trade (base — scaled 1x-2x by streak length)
+  min_streak: 2  # Bet contrarian after 2+ consecutive same-direction windows
   min_entry_price: 0.05  # Don't buy tokens the market thinks are worthless
-  max_entry_price: 0.55  # Don't buy above 55¢ (fees eat edge, move already priced in)
-  entry_window_secs: 60  # Trade in last 60s of window
+  max_entry_price: 0.55  # Don't buy above 55¢ (fees eat edge)
+  entry_window_secs: 300  # Enter 5 min before close (T-300s) for better prices
   max_trades_per_hour: 4  # Safety: max 4 trades/hour (one per window)
   max_consec_losses: 3  # Pause 1 hour after 3 consecutive losses
   max_daily_loss: 50  # Stop trading for the day after $50 loss
